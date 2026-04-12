@@ -252,7 +252,7 @@ function Settings({ user: _user }: { user: User }) {
         body: JSON.stringify({
           name: edit.name || undefined,
           prompt_override: edit.prompt_override || null,
-          rules: edit.rules || null,
+          rules: edit.rules,
           schedule_minutes: edit.schedule_minutes,
           daily_limit: edit.daily_limit,
           enabled: agent.enabled,
@@ -1049,9 +1049,9 @@ const PROMPT_TEMPLATES: Record<string, { label: string; value: string }[]> = {
       value: `你是一位专业前端工程师，只修改前端相关文件（.tsx/.ts/.css）。
 
 ## 修复规则
-1. **只改前端** — 不动后端 Go 代码，不改 API 接口
-2. **最小改动** — 不重构、不改命名、不加注释
-3. **匹配现有风格** — 使用项目已有的 Tailwind 类和组件
+1. **只改前端** — 不动后端代码，不改 API 接口，不改 CI/CD 流水线
+2. **最小改动** — 不重构、不改命名、不加无用注释
+3. **匹配现有风格** — 使用项目已有的组件和样式系统
 
 ## 工单信息
 标题：{{.IssueTitle}}
@@ -1067,10 +1067,10 @@ const PROMPT_TEMPLATES: Record<string, { label: string; value: string }[]> = {
     },
     {
       label: '专注后端修复',
-      value: `你是一位专业 Go 后端工程师，只修改后端逻辑文件。
+      value: `你是一位专业后端工程师，只修改后端逻辑文件。
 
 ## 修复规则
-1. **只改后端** — 不动前端文件，不改 SQL migration
+1. **只改后端** — 不动前端文件，不改 SQL migration，不改 CI/CD 流水线
 2. **最小改动** — 不加错误处理包装、不改函数签名
 3. **匹配现有风格** — 遵循项目的错误处理和日志风格
 
@@ -1089,7 +1089,27 @@ const PROMPT_TEMPLATES: Record<string, { label: string; value: string }[]> = {
   ],
   plan: [
     {
-      label: '功能规划模板',
+      label: '测试场景规划',
+      value: `你是项目测试规划 Agent，为 {{.Owner}}/{{.Repo}} 生成 {{.Count}} 条新测试场景，补充到 Backlog。
+
+## 项目状态
+- Staging 地址：{{.StagingURL}}
+- 待测场景：{{.PendingCount}} 条
+- 最近 Issue：
+{{.RecentIssues}}
+
+## 生成规则
+1. 每条场景有明确操作步骤和二值化验收标准（PASS/FAIL）
+2. 优先级：P1=核心流程，P2=重要功能，P3=边界异常，P4=体验优化
+3. 不重复已有场景（标题关键词重叠 > 60% 则跳过）
+
+## 输出 {{.Count}} 条，格式：
+- **标题**：[简短动词短语]
+- **步骤**：[操作 + 验证标准]
+- **优先级**：P1/P2/P3`,
+    },
+    {
+      label: '功能规划',
       value: `你是项目技术负责人，为 {{.Owner}}/{{.Repo}} 生成 {{.Count}} 条新功能或改进建议。
 
 ## 项目状态
@@ -1100,7 +1120,7 @@ const PROMPT_TEMPLATES: Record<string, { label: string; value: string }[]> = {
 
 ## 输出要求
 每条建议格式：
-- **标题**：[简洁动词短语，如"优化登录页加载速度"]
+- **标题**：[简洁动词短语]
 - **描述**：[2-3句，说明具体改进点和预期收益]
 - **优先级**：P1/P2/P3
 
@@ -1140,15 +1160,17 @@ const RULES_TEMPLATES: Record<string, { label: string; value: string }[]> = {
   explore: [
     {
       label: '标准优先级规则',
-      value: `P1: crash, panic, data loss, 崩溃, 数据丢失, 支付失败
-P2: error, exception, 报错, 无法登录, 功能异常
-P3: warning, slow, timeout, 加载慢, 超时`,
+      value: `P1: crash, panic, 崩溃, 页面 404/500, 核心功能不可用
+P2: error, exception, 报错, 功能完全不工作, 数据异常
+P3: warning, slow, timeout, 加载慢, 有明显缺陷
+P4: 样式问题, 轻微体验问题, 文案错误`,
     },
     {
-      label: '电商场景规则',
-      value: `P1: 支付, payment, checkout, 订单丢失, crash
-P2: 加入购物车, 库存, inventory, error
-P3: 图片加载, 样式, slow, warning`,
+      label: 'SaaS 场景规则',
+      value: `P1: 无法登录, 无法注册, 支付失败, 数据丢失, 页面崩溃
+P2: 核心功能报错, 数据不更新, 表单无法提交
+P3: 加载慢, 样式错乱, 部分功能异常
+P4: 文案问题, 样式微调, 体验优化`,
     },
   ],
   fix: [
@@ -1157,23 +1179,41 @@ P3: 图片加载, 样式, slow, warning`,
       value: `- 禁止引入新的外部依赖
 - 禁止修改 CI/CD 流水线文件（.github/workflows/）
 - 禁止使用 git push --force
-- 修改数据库相关代码时必须保证向后兼容`,
+- 修改数据库相关代码时必须保证向后兼容
+- fix_attempts 达到 3 次仍失败 → 改为 needs-human`,
     },
     {
       label: '代码规范约束',
-      value: `- 所有新增变量使用驼峰命名（Go）或 camelCase（JS/TS）
-- 错误信息使用中文
+      value: `- 注释与错误提示文案使用中文
+- 不引入新依赖，优先使用已有组件和工具函数
 - 禁止添加无用注释（代码即文档）
-- 日志级别：业务错误用 Error，预期情况用 Info`,
+- 只修改与 Issue 相关的文件，不做额外重构`,
     },
   ],
   plan: [
     {
-      label: '规划约束',
+      label: '场景约束',
+      value: `- 每条场景聚焦单一用户操作（步骤不超过 5 步）
+- 验收标准必须二值化（PASS/FAIL），不含糊
+- 优先覆盖核心用户路径，再覆盖边界和异常
+- 每次生成 10-20 条，聚焦覆盖空白区域`,
+    },
+    {
+      label: '功能规划约束',
       value: `- 每条建议必须可在 1-3 天内完成
 - 优先修复现有 Bug，再提新功能
 - 不建议涉及数据库 Schema 变更的功能（风险高）
 - 建议要可测试，需有明确的验收标准`,
+    },
+  ],
+  master: [
+    {
+      label: '合并验收约束',
+      value: `- 必须等待 code review 完成后再决定合并
+- Review 通过 → squash merge
+- Review 请求修改 → 回滚 issue 为 open，等待 fix-agent 处理
+- staging_url 未配置时跳过 UI 验收，仅验证 commit SHA
+- fix_attempts >= 3 → 改为 needs-human，停止自动处理`,
     },
   ],
   generic: [
@@ -1261,7 +1301,7 @@ function AgentRulesField({ agentType, value, onChange }: {
     <div>
       <div className="flex items-center justify-between mb-1">
         <label className="text-sm font-medium text-gray-700">
-          Rules
+          规则约束
           <span className="ml-1 text-xs font-normal text-gray-400">
             {isExplore ? '（优先级分类规则）' : '（追加到 Prompt 末尾的约束，可选）'}
           </span>
