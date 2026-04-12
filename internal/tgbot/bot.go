@@ -24,9 +24,9 @@ import (
 
 	"github.com/fixloop/fixloop/internal/config"
 	"github.com/fixloop/fixloop/internal/crypto"
-	"github.com/fixloop/fixloop/internal/runner"
 	githubclient "github.com/fixloop/fixloop/internal/github"
 	"github.com/fixloop/fixloop/internal/gitops"
+	"github.com/fixloop/fixloop/internal/runner"
 	"github.com/fixloop/fixloop/internal/storage"
 )
 
@@ -45,11 +45,12 @@ type BotScheduler interface {
 
 // Bot wraps the Telegram bot API and handles commands and notifications.
 type Bot struct {
-	api       *tgbotapi.BotAPI
-	db        *sql.DB
-	cfg       *config.Config
-	r2        *storage.R2Client // optional; nil = R2 disabled
-	scheduler BotScheduler      // optional; nil = can't trigger immediately
+	api           *tgbotapi.BotAPI
+	db            *sql.DB
+	cfg           *config.Config
+	r2            *storage.R2Client // optional; nil = R2 disabled
+	scheduler     BotScheduler      // optional; nil = can't trigger immediately
+	knownChatSeen sync.Map          // chatID(int64) → "title|type|active" — dedup DB writes
 }
 
 // New creates a Bot. Returns nil, nil if no token is configured (TG disabled).
@@ -575,11 +576,11 @@ func (b *Bot) cmdSubmitIssue(ctx context.Context, chatID, senderChatID int64, ar
 		Test struct {
 			StagingURL string `json:"staging_url"`
 		} `json:"test"`
-		S3 projectS3Cfg `json:"s3"`
-		AIRunner  string `json:"ai_runner"`
-		AIModel   string `json:"ai_model"`
-		AIAPIBase string `json:"ai_api_base"`
-		AIAPIKey  string `json:"ai_api_key"` // hex(AES encrypted)
+		S3              projectS3Cfg `json:"s3"`
+		AIRunner        string       `json:"ai_runner"`
+		AIModel         string       `json:"ai_model"`
+		AIAPIBase       string       `json:"ai_api_base"`
+		AIAPIKey        string       `json:"ai_api_key"` // hex(AES encrypted)
 		PromptOverrides struct {
 			IssueAnalysis string `json:"issue_analysis,omitempty"`
 		} `json:"prompt_overrides,omitempty"`
@@ -877,10 +878,16 @@ func (b *Bot) upsertKnownChat(ctx context.Context, chatID int64, title, chatType
 	if b.db == nil {
 		return
 	}
+	// Deduplicate: skip DB write if nothing changed since last time we upserted this chat.
+	key := fmt.Sprintf("%s|%s|%d", title, chatType, active)
+	if prev, ok := b.knownChatSeen.Load(chatID); ok && prev.(string) == key {
+		return
+	}
 	_, _ = b.db.ExecContext(ctx,
 		`INSERT INTO tg_known_chats (chat_id, title, chat_type, active)
 		 VALUES (?, ?, ?, ?)
 		 ON DUPLICATE KEY UPDATE title = VALUES(title), chat_type = VALUES(chat_type), active = VALUES(active)`,
 		chatID, title, chatType, active,
 	)
+	b.knownChatSeen.Store(chatID, key)
 }

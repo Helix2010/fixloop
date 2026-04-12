@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 	"text/template"
 	"time"
 
@@ -19,8 +21,8 @@ import (
 	"github.com/fixloop/fixloop/internal/crypto"
 	githubclient "github.com/fixloop/fixloop/internal/github"
 	"github.com/fixloop/fixloop/internal/gitops"
-	"github.com/fixloop/fixloop/internal/runner"
 	"github.com/fixloop/fixloop/internal/notify"
+	"github.com/fixloop/fixloop/internal/runner"
 )
 
 //go:embed prompts/fix.txt
@@ -53,6 +55,41 @@ type projectConf struct {
 	AIModel       string `json:"ai_model"`
 	AIAPIBase     string `json:"ai_api_base"`
 	AIAPIKey      string `json:"ai_api_key"`
+}
+
+// fixRules holds parsed control directives extracted from the agent's rules field.
+type fixRules struct {
+	maxPriority int    // 0 = no filter; otherwise only pick issues with priority <= maxPriority
+	maxAttempts int    // needs-human threshold (default 3)
+	promptRules string // rules text with directives stripped, appended to prompt
+}
+
+// parseFixRules extracts MAX_PRIORITY and MAX_ATTEMPTS directives from the rules
+// string. Directive lines are consumed and not included in promptRules.
+// Format:  MAX_PRIORITY: <n>   — skip issues with priority > n (e.g. 2 = only P1/P2)
+//
+//	MAX_ATTEMPTS: <n>   — mark needs-human after n failed attempts
+func parseFixRules(rules string) fixRules {
+	fr := fixRules{maxPriority: 0, maxAttempts: 3}
+	var promptLines []string
+	for _, line := range strings.Split(rules, "\n") {
+		lower := strings.ToLower(strings.TrimSpace(line))
+		if strings.HasPrefix(lower, "max_priority:") {
+			if n, err := strconv.Atoi(strings.TrimSpace(line[len("max_priority:"):])); err == nil && n > 0 {
+				fr.maxPriority = n
+			}
+			continue // directive line — don't pass to prompt
+		}
+		if strings.HasPrefix(lower, "max_attempts:") {
+			if n, err := strconv.Atoi(strings.TrimSpace(line[len("max_attempts:"):])); err == nil && n > 0 {
+				fr.maxAttempts = n
+			}
+			continue
+		}
+		promptLines = append(promptLines, line)
+	}
+	fr.promptRules = strings.TrimSpace(strings.Join(promptLines, "\n"))
+	return fr
 }
 
 type issueRow struct {
@@ -119,8 +156,14 @@ func (a *Agent) Run(ctx context.Context, projectID int64, projectAgentID int64) 
 		return
 	}
 
+	rules := ""
+	if rulesDB.Valid {
+		rules = rulesDB.String
+	}
+	fr := parseFixRules(rules)
+
 	// Pick one open issue (optimistic lock)
-	issue, err := a.claimIssue(ctx, projectID)
+	issue, err := a.claimIssue(ctx, projectID, fr)
 	if err != nil || issue == nil {
 		if err != nil {
 			slog.Error("fix: claim issue", "project_id", projectID, "err", err)
@@ -139,19 +182,15 @@ func (a *Agent) Run(ctx context.Context, projectID int64, projectAgentID int64) 
 	if promptOverrideDB.Valid {
 		promptOverride = promptOverrideDB.String
 	}
-	rules := ""
-	if rulesDB.Valid {
-		rules = rulesDB.String
-	}
 	agentrun.WithRecover(runID, a.DB, func() {
-		output, finalStatus := a.runFix(ctx, projectID, userID, runID, issue, &pcfg, promptOverride, rules)
+		output, finalStatus := a.runFix(ctx, projectID, userID, runID, issue, &pcfg, promptOverride, fr)
 		if err := agentrun.Finish(ctx, a.DB, runID, finalStatus, output); err != nil {
 			slog.Error("fix: finish agentrun", "run_id", runID, "err", err)
 		}
 	})
 }
 
-func (a *Agent) runFix(ctx context.Context, projectID, userID, runID int64, issue *issueRow, pcfg *projectConf, promptOverride, rules string) (string, string) {
+func (a *Agent) runFix(ctx context.Context, projectID, userID, runID int64, issue *issueRow, pcfg *projectConf, promptOverride string, fr fixRules) (string, string) {
 	var logBuf bytes.Buffer
 	logf := func(msg string, args ...any) {
 		line := fmt.Sprintf(msg, args...)
@@ -212,7 +251,7 @@ func (a *Agent) runFix(ctx context.Context, projectID, userID, runID int64, issu
 
 	// Build prompt
 	dirTree := gitops.DirTree(repoPath, 3)
-	prompt, err := buildPrompt(issue.title, "", dirTree, "", promptOverride, rules)
+	prompt, err := buildPrompt(issue.title, "", dirTree, "", promptOverride, fr.promptRules)
 	if err != nil {
 		logf("ERROR: build prompt: %v", err)
 		a.releaseIssue(ctx, issue.id)
@@ -328,8 +367,8 @@ func (a *Agent) runFix(ctx context.Context, projectID, userID, runID int64, issu
 		logf("WARN: update fix_attempts: %v", err)
 	}
 
-	// Check if needs-human (>= 3 attempts after increment)
-	if issue.fixAttempts+1 >= 3 {
+	// Check if needs-human (configurable via MAX_ATTEMPTS rule, default 3)
+	if issue.fixAttempts+1 >= fr.maxAttempts {
 		if _, err := a.DB.ExecContext(ctx,
 			`UPDATE issues SET status = 'needs-human' WHERE id = ? AND status = 'fixing'`,
 			issue.id,
@@ -345,15 +384,18 @@ func (a *Agent) runFix(ctx context.Context, projectID, userID, runID int64, issu
 	return logBuf.String(), "success"
 }
 
-func (a *Agent) claimIssue(ctx context.Context, projectID int64) (*issueRow, error) {
+func (a *Agent) claimIssue(ctx context.Context, projectID int64, fr fixRules) (*issueRow, error) {
 	var issue issueRow
-	err := a.DB.QueryRowContext(ctx,
-		`SELECT id, github_number, title, fix_attempts FROM issues
-		 WHERE project_id = ? AND status = 'open'
-		 ORDER BY priority ASC, fix_attempts ASC, id ASC
-		 LIMIT 1`,
-		projectID,
-	).Scan(&issue.id, &issue.githubNumber, &issue.title, &issue.fixAttempts)
+	query := `SELECT id, github_number, title, fix_attempts FROM issues
+	          WHERE project_id = ? AND status = 'open'`
+	args := []interface{}{projectID}
+	if fr.maxPriority > 0 {
+		query += " AND priority <= ?"
+		args = append(args, fr.maxPriority)
+	}
+	query += " ORDER BY priority ASC, fix_attempts ASC, id ASC LIMIT 1"
+	err := a.DB.QueryRowContext(ctx, query, args...).Scan(
+		&issue.id, &issue.githubNumber, &issue.title, &issue.fixAttempts)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

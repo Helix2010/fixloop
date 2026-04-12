@@ -265,7 +265,7 @@ func (a *Agent) runLoop(
 
 		screenshotURL := a.uploadScreenshots(ctx, result.Screenshots, userID, projectID, runID, sc.id, 0)
 
-		priority := classifyPriority(result.ErrorType, result.ErrorMsg, priorityRules)
+		priority := classifyPriority(sc.title, result.ErrorType, result.ErrorMsg, priorityRules)
 		issueTitle := fmt.Sprintf("[AutoTest][P%d] %s", priority, sc.title)
 		issueBody := buildIssueBody(sc, pcfg.Test.StagingURL, result, screenshotURL, runID)
 		issue, err := ghClient.CreateIssue(ctx,
@@ -418,12 +418,17 @@ func seedCheckIndex(title string) int {
 //
 //	P<n>: keyword1, keyword2, ...
 //
-// The combined text of errorType+" "+errorMsg is matched case-insensitively
-// against each keyword; the first matching level wins. Falls back to hardcoded
-// logic when no rules are configured or no rule matches.
-func classifyPriority(errorType, errorMsg, priorityRules string) int {
+// The combined text of scenarioTitle+" "+errorType+" "+errorMsg is matched
+// case-insensitively against each keyword; the first matching level wins.
+// Including scenarioTitle lets business-level rules (e.g. "P1: 用户无法登录")
+// match against the scenario description as well as the raw Playwright error.
+// Falls back to hardcoded logic when no rules are configured or no rule matches.
+func classifyPriority(scenarioTitle, errorType, errorMsg, priorityRules string) int {
 	if priorityRules != "" {
-		combined := strings.ToLower(errorType + " " + errorMsg)
+		if len(errorMsg) > 2000 {
+			errorMsg = errorMsg[:2000]
+		}
+		combined := strings.ToLower(scenarioTitle + " " + errorType + " " + errorMsg)
 		for _, line := range strings.Split(priorityRules, "\n") {
 			line = strings.TrimSpace(line)
 			// expect format:  P<digit>: kw1, kw2, ...

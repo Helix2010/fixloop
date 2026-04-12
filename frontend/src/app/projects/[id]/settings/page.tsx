@@ -36,7 +36,6 @@ const AGENT_TYPE_DESC: Record<string, string> = {
   generic: '自定义 AI Agent，按 Prompt 执行任意任务',
 };
 
-
 const NAV_SECTIONS = [
   { id: 'repo',     label: '代码仓库' },
   { id: 'test',     label: '测试环境' },
@@ -251,7 +250,7 @@ function Settings({ user: _user }: { user: User }) {
         method: 'PATCH',
         body: JSON.stringify({
           name: edit.name || undefined,
-          prompt_override: edit.prompt_override || null,
+          prompt_override: edit.prompt_override,
           rules: edit.rules,
           schedule_minutes: edit.schedule_minutes,
           daily_limit: edit.daily_limit,
@@ -1160,27 +1159,35 @@ const RULES_TEMPLATES: Record<string, { label: string; value: string }[]> = {
   explore: [
     {
       label: '标准优先级规则',
-      value: `P1: crash, panic, 崩溃, 页面 404/500, 核心功能不可用
-P2: error, exception, 报错, 功能完全不工作, 数据异常
-P3: warning, slow, timeout, 加载慢, 有明显缺陷
-P4: 样式问题, 轻微体验问题, 文案错误`,
+      value: `# 规则说明：每行 P<n>: 关键词1, 关键词2, ...
+# 匹配范围：场景标题 + 错误类型(crash/timeout/assertion/console_error) + 错误信息
+# 按顺序匹配，第一条命中的规则生效
+
+P1: crash, err_connection_refused, net::err, 核心功能, 无法访问, 首页
+P2: assertion, console_error, 登录, 注册, 支付, 提交, 数据
+P3: timeout, 加载慢, 超时
+P4: 样式, 文案, 布局`,
     },
     {
       label: 'SaaS 场景规则',
-      value: `P1: 无法登录, 无法注册, 支付失败, 数据丢失, 页面崩溃
-P2: 核心功能报错, 数据不更新, 表单无法提交
-P3: 加载慢, 样式错乱, 部分功能异常
-P4: 文案问题, 样式微调, 体验优化`,
+      value: `P1: crash, 无法登录, 无法注册, 支付失败, 数据丢失, 首页崩溃
+P2: assertion, console_error, 核心功能, 表单, 用户信息, 权限
+P3: timeout, 加载慢, 列表, 搜索
+P4: 样式, 文案, 图标, 体验`,
     },
   ],
   fix: [
+    {
+      label: '优先级控制',
+      value: `MAX_PRIORITY: 2
+MAX_ATTEMPTS: 3`,
+    },
     {
       label: '安全约束',
       value: `- 禁止引入新的外部依赖
 - 禁止修改 CI/CD 流水线文件（.github/workflows/）
 - 禁止使用 git push --force
-- 修改数据库相关代码时必须保证向后兼容
-- fix_attempts 达到 3 次仍失败 → 改为 needs-human`,
+- 修改数据库相关代码时必须保证向后兼容`,
     },
     {
       label: '代码规范约束',
@@ -1333,17 +1340,18 @@ function AgentRulesField({ agentType, value, onChange }: {
         <div className="mb-2 p-3 bg-gray-50 border border-gray-200 rounded-lg text-xs text-gray-600 space-y-1.5">
           {isExplore ? (
             <>
-              <p className="font-medium text-gray-700">Explore Rules — 工单优先级分类规则</p>
+              <p className="font-medium text-gray-700">Explore 规则约束 — 工单优先级分类</p>
               <p>每行一条规则，格式：<code className="font-mono bg-white px-1 border border-gray-200 rounded">P&lt;数字&gt;: 关键词1, 关键词2, ...</code></p>
-              <p>系统对 <strong>错误类型 + 错误信息</strong> 做大小写不敏感匹配，第一条命中的规则生效。</p>
-              <pre className="bg-white border border-gray-200 rounded p-2 font-mono text-xs leading-relaxed">{`P1: crash, panic, 崩溃, 数据丢失\nP2: error, exception, 报错\nP3: slow, timeout, warning`}</pre>
+              <p>匹配范围（大小写不敏感）：<strong>场景标题</strong> + <strong>错误类型</strong> + <strong>错误信息</strong>，按顺序匹配，第一条命中生效。</p>
+              <p className="text-gray-500">错误类型固定为：<code className="font-mono bg-white px-1 border border-gray-200 rounded">crash</code> / <code className="font-mono bg-white px-1 border border-gray-200 rounded">timeout</code> / <code className="font-mono bg-white px-1 border border-gray-200 rounded">assertion</code> / <code className="font-mono bg-white px-1 border border-gray-200 rounded">console_error</code></p>
+              <pre className="bg-white border border-gray-200 rounded p-2 font-mono text-xs leading-relaxed">{`P1: crash, 无法登录, 支付失败\nP2: assertion, console_error, 核心功能\nP3: timeout, 加载慢`}</pre>
             </>
           ) : (
             <>
-              <p className="font-medium text-gray-700">Rules — 追加约束</p>
-              <p>纯文本，保存后会自动追加到 Prompt 末尾（<code className="font-mono bg-white px-1 border border-gray-200 rounded">## Additional Rules</code> 段）。</p>
-              <p>可写任意约束，例如禁止修改某些文件、要求特定命名规范、限制输出格式等。</p>
-              <p>无需占位符，直接写人类可读的指令即可。</p>
+              <p className="font-medium text-gray-700">规则约束 — 追加约束 + 控制指令</p>
+              <p>纯文本，追加到 Prompt 末尾（<code className="font-mono bg-white px-1 border border-gray-200 rounded">## Additional Rules</code> 段）。</p>
+              <p>可写任意约束，也支持以下 <strong>Fix Agent 专属指令</strong>（不会出现在 Prompt 中）：</p>
+              <pre className="bg-white border border-gray-200 rounded p-2 font-mono text-xs leading-relaxed">{`MAX_PRIORITY: 2   # 只修复 P1/P2，P3/P4 跳过\nMAX_ATTEMPTS: 3   # N 次失败后标记 needs-human`}</pre>
             </>
           )}
         </div>
