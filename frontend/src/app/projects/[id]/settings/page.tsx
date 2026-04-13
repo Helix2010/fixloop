@@ -872,11 +872,25 @@ function Settings({ user: _user }: { user: User }) {
                   onChange={set('tg_chat_id')}
                 >
                   <option value="">— 留空，发送到个人账号 —</option>
-                  {tgChats.map(chat => (
-                    <option key={chat.chat_id} value={String(chat.chat_id)}>
-                      {chat.title}（{chat.chat_id}）
-                    </option>
-                  ))}
+                  {tgChats
+                    .filter(c => !c.bound_project_id || String(c.chat_id) === form.tg_chat_id)
+                    .map(chat => (
+                      <option key={chat.chat_id} value={String(chat.chat_id)}>
+                        {chat.title}（{chat.chat_id}）
+                      </option>
+                    ))}
+                  {(() => {
+                    const alreadyBound = tgChats.filter(c => !!c.bound_project_id && String(c.chat_id) !== form.tg_chat_id);
+                    if (alreadyBound.length === 0) return null;
+                    return <>
+                      <option disabled>── 已关联其他项目（不可选）──</option>
+                      {alreadyBound.map(chat => (
+                        <option key={chat.chat_id} value={String(chat.chat_id)} disabled>
+                          {chat.title}（已关联：{chat.bound_project_name}）
+                        </option>
+                      ))}
+                    </>;
+                  })()}
                   {form.tg_chat_id && !tgChats.find(c => String(c.chat_id) === form.tg_chat_id) && (
                     <option value={form.tg_chat_id}>{form.tg_chat_id}（手动输入）</option>
                   )}

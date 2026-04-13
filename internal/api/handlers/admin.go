@@ -232,16 +232,27 @@ func computeWorkspaceStat(dir string) workspaceInfo {
 }
 
 type tgChatResp struct {
-	ChatID   int64  `json:"chat_id"`
-	Title    string `json:"title"`
-	ChatType string `json:"chat_type"`
+	ChatID           int64   `json:"chat_id"`
+	Title            string  `json:"title"`
+	ChatType         string  `json:"chat_type"`
+	BoundProjectID   *int64  `json:"bound_project_id,omitempty"`
+	BoundProjectName *string `json:"bound_project_name,omitempty"`
 }
 
-// GetTGChats returns known group chats where the bot is active.
+// GetTGChats returns known group chats where the bot is active, annotated with
+// which project (if any) each chat is already bound to.
 // GET /api/v1/admin/tg-chats
 func (h *AdminHandler) GetTGChats(c *gin.Context) {
 	rows, err := h.DB.QueryContext(c.Request.Context(),
-		`SELECT chat_id, title, chat_type FROM tg_known_chats WHERE active = 1 ORDER BY title`)
+		`SELECT k.chat_id, k.title, k.chat_type,
+		        p.id   AS bound_project_id,
+		        p.name AS bound_project_name
+		 FROM tg_known_chats k
+		 LEFT JOIN projects p
+		        ON CAST(JSON_EXTRACT(p.config, '$.tg_chat_id') AS SIGNED) = k.chat_id
+		       AND p.deleted_at IS NULL
+		 WHERE k.active = 1
+		 ORDER BY k.title`)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{"data": []tgChatResp{}})
 		return
@@ -250,9 +261,17 @@ func (h *AdminHandler) GetTGChats(c *gin.Context) {
 	var chats []tgChatResp
 	for rows.Next() {
 		var item tgChatResp
-		if rows.Scan(&item.ChatID, &item.Title, &item.ChatType) == nil {
-			chats = append(chats, item)
+		var boundID sql.NullInt64
+		var boundName sql.NullString
+		if rows.Scan(&item.ChatID, &item.Title, &item.ChatType, &boundID, &boundName) != nil {
+			continue
 		}
+		if boundID.Valid {
+			item.BoundProjectID = &boundID.Int64
+			s := boundName.String
+			item.BoundProjectName = &s
+		}
+		chats = append(chats, item)
 	}
 	if err := rows.Err(); err != nil {
 		c.JSON(http.StatusOK, gin.H{"data": []tgChatResp{}})

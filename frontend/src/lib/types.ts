@@ -119,6 +119,8 @@ export interface TgChat {
   chat_id: number;
   title: string;
   chat_type: string;
+  bound_project_id?: number | null;
+  bound_project_name?: string | null;
 }
 
 export interface Pagination {

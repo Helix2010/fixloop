@@ -45,7 +45,7 @@ type ProjectHandler struct {
 type storedGitHub struct {
 	Owner         string `json:"owner"`
 	Repo          string `json:"repo"`
-	PAT           string `json:"pat"`             // hex(AES-GCM encrypted)
+	PAT           string `json:"pat"` // hex(AES-GCM encrypted)
 	FixBaseBranch string `json:"fix_base_branch"`
 }
 
@@ -63,29 +63,29 @@ type storedVercel struct {
 type storedTest struct {
 	StagingURL      string `json:"staging_url,omitempty"`
 	StagingAuthType string `json:"staging_auth_type,omitempty"` // "none"|"basic"|"bearer"
-	StagingAuth     string `json:"staging_auth,omitempty"`       // hex(AES-GCM encrypted JSON)
+	StagingAuth     string `json:"staging_auth,omitempty"`      // hex(AES-GCM encrypted JSON)
 }
 
 type storedS3 struct {
-	Endpoint    string `json:"endpoint,omitempty"`     // e.g. https://obs.cn-north-4.myhuaweicloud.com
+	Endpoint    string `json:"endpoint,omitempty"` // e.g. https://obs.cn-north-4.myhuaweicloud.com
 	Bucket      string `json:"bucket,omitempty"`
-	Region      string `json:"region,omitempty"`       // e.g. cn-north-4
+	Region      string `json:"region,omitempty"` // e.g. cn-north-4
 	AccessKeyID string `json:"access_key_id,omitempty"`
-	SecretKey   string `json:"secret_key,omitempty"`   // hex(AES-GCM encrypted)
+	SecretKey   string `json:"secret_key,omitempty"` // hex(AES-GCM encrypted)
 }
 
 type projectConfig struct {
-	GitHub        storedGitHub       `json:"github"`
-	IssueTracker  storedIssueTracker `json:"issue_tracker"`
-	SSHPrivateKey string             `json:"ssh_private_key"`      // hex(AES-GCM encrypted)
-	DeployKeyID   int64              `json:"deploy_key_id,omitempty"`
-	Vercel        storedVercel       `json:"vercel,omitempty"`
-	Test          storedTest         `json:"test,omitempty"`
-	S3            storedS3           `json:"s3,omitempty"`
-	AIRunner      string             `json:"ai_runner,omitempty"`
-	AIModel       string             `json:"ai_model,omitempty"`
-	AIAPIBase     string             `json:"ai_api_base,omitempty"`
-	AIAPIKey      string             `json:"ai_api_key,omitempty"` // hex(AES-GCM encrypted)
+	GitHub          storedGitHub       `json:"github"`
+	IssueTracker    storedIssueTracker `json:"issue_tracker"`
+	SSHPrivateKey   string             `json:"ssh_private_key"` // hex(AES-GCM encrypted)
+	DeployKeyID     int64              `json:"deploy_key_id,omitempty"`
+	Vercel          storedVercel       `json:"vercel,omitempty"`
+	Test            storedTest         `json:"test,omitempty"`
+	S3              storedS3           `json:"s3,omitempty"`
+	AIRunner        string             `json:"ai_runner,omitempty"`
+	AIModel         string             `json:"ai_model,omitempty"`
+	AIAPIBase       string             `json:"ai_api_base,omitempty"`
+	AIAPIKey        string             `json:"ai_api_key,omitempty"`    // hex(AES-GCM encrypted)
 	NotifyEvents    []string           `json:"notify_events,omitempty"` // nil/empty = all enabled
 	TGChatID        *int64             `json:"tg_chat_id,omitempty"`
 	WebhookToken    string             `json:"webhook_token,omitempty"`  // legacy single token; migrated on first write
@@ -135,7 +135,7 @@ type createProjectReq struct {
 type patchProjectReq struct {
 	Name   *string `json:"name"`
 	GitHub *struct {
-		PAT          string `json:"pat"`           // leave empty to keep existing
+		PAT           string `json:"pat"`             // leave empty to keep existing
 		FixBaseBranch string `json:"fix_base_branch"` // leave empty to keep existing
 	} `json:"github"`
 	IssueTracker *struct {
@@ -159,12 +159,12 @@ type patchProjectReq struct {
 		AccessKeyID string `json:"access_key_id"`
 		SecretKey   string `json:"secret_key"` // leave empty to keep existing
 	} `json:"s3"`
-	AIRunner     *string   `json:"ai_runner"`
-	AIModel      *string   `json:"ai_model"`
-	AIAPIBase    *string   `json:"ai_api_base"`
-	AIAPIKey     *string   `json:"ai_api_key"`
+	AIRunner        *string   `json:"ai_runner"`
+	AIModel         *string   `json:"ai_model"`
+	AIAPIBase       *string   `json:"ai_api_base"`
+	AIAPIKey        *string   `json:"ai_api_key"`
 	NotifyEvents    *[]string `json:"notify_events"`
-	TGChatID     *int64    `json:"tg_chat_id"`
+	TGChatID        *int64    `json:"tg_chat_id"`
 	PromptOverrides *struct {
 		IssueAnalysis *string `json:"issue_analysis"`
 	} `json:"prompt_overrides"`
@@ -197,15 +197,15 @@ type projectResp struct {
 		Region      string `json:"region,omitempty"`
 		AccessKeyID string `json:"access_key_id,omitempty"`
 	} `json:"s3,omitempty"`
-	AIRunner        string    `json:"ai_runner,omitempty"`
-	AIModel         string    `json:"ai_model,omitempty"`
-	NotifyEvents    []string  `json:"notify_events"`
-	TGChatID        *int64    `json:"tg_chat_id,omitempty"`
+	AIRunner        string        `json:"ai_runner,omitempty"`
+	AIModel         string        `json:"ai_model,omitempty"`
+	NotifyEvents    []string      `json:"notify_events"`
+	TGChatID        *int64        `json:"tg_chat_id,omitempty"`
 	WebhookTokens   []MaskedToken `json:"webhook_tokens,omitempty"`
 	PromptOverrides struct {
 		IssueAnalysis string `json:"issue_analysis,omitempty"`
 	} `json:"prompt_overrides,omitempty"`
-	CreatedAt    time.Time `json:"created_at"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // projectRow holds a raw project DB row before config parsing.
@@ -554,6 +554,18 @@ func (h *ProjectHandler) Update(c *gin.Context) {
 		if *req.TGChatID == 0 {
 			cfg.TGChatID = nil // 0 means "clear"
 		} else {
+			// Enforce uniqueness: a group can only be bound to one project.
+			var conflictID int64
+			err := h.DB.QueryRowContext(c.Request.Context(),
+				`SELECT id FROM projects
+				 WHERE CAST(JSON_EXTRACT(config, '$.tg_chat_id') AS SIGNED) = ?
+				   AND id != ? AND deleted_at IS NULL LIMIT 1`,
+				*req.TGChatID, projectID,
+			).Scan(&conflictID)
+			if err == nil {
+				response.Err(c, http.StatusConflict, "TG_CHAT_ALREADY_BOUND", "该群组已关联到其他项目，请先解除原绑定")
+				return
+			}
 			cfg.TGChatID = req.TGChatID
 		}
 	}

@@ -96,7 +96,7 @@ func (b *Bot) pollLoop(ctx context.Context) {
 	offset := b.loadOffset(ctx)
 	u := tgbotapi.NewUpdate(offset)
 	u.Timeout = 30
-	u.AllowedUpdates = []string{"message", "my_chat_member"}
+	u.AllowedUpdates = []string{"message", "my_chat_member", "callback_query"}
 
 	updates := b.api.GetUpdatesChan(u)
 	for {
@@ -119,6 +119,10 @@ func (b *Bot) pollLoop(ctx context.Context) {
 					}
 					b.upsertKnownChat(ctx, chat.ID, chat.Title, chat.Type, active)
 				}
+			}
+			if update.CallbackQuery != nil {
+				b.handleCallback(ctx, update.CallbackQuery)
+				continue
 			}
 			if update.Message == nil {
 				continue
@@ -159,7 +163,17 @@ func (b *Bot) pollLoop(ctx context.Context) {
 					if rest := strings.SplitN(caption, " ", 2); len(rest) == 2 {
 						args = rest[1]
 					}
-					b.cmdSubmitIssue(ctx, msg.Chat.ID, senderChatID, args, msg)
+					// In a bound group: allow /issue <description> without project name.
+					if msg.Chat.Type != "private" {
+						groupProj := b.resolveGroupProject(ctx, msg.Chat.ID)
+						if groupProj == "" {
+							b.send(msg.Chat.ID, "请先将此群关联到项目，在项目设置页选择此群。")
+						} else {
+							b.cmdSubmitIssue(ctx, msg.Chat.ID, senderChatID, groupProj+" "+args, msg)
+						}
+					} else {
+						b.cmdSubmitIssue(ctx, msg.Chat.ID, senderChatID, args, msg)
+					}
 				}
 			} else if isPrivate {
 				// Plain text in private chat: treat as an issue submission attempt
@@ -173,13 +187,40 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 	chatID := msg.Chat.ID // reply target (group or private)
 	cmd := msg.Command()
 	args := strings.TrimSpace(msg.CommandArguments())
+	isPrivate := msg.Chat.Type == "private"
 
 	// In groups, msg.Chat.ID is the group ID, not the user's personal chat ID.
 	// tg_chat_id in users table stores the personal chat ID (== msg.From.ID).
 	// Use senderID for user lookup; chatID for replies.
 	senderID := chatID
-	if msg.Chat.Type != "private" && msg.From != nil {
+	if !isPrivate && msg.From != nil {
 		senderID = msg.From.ID
+	}
+
+	// In group chats: look up the project bound to this group so commands that
+	// require a project name can be used without typing it explicitly.
+	var boundProject string
+	if !isPrivate {
+		boundProject = b.resolveGroupProject(ctx, chatID)
+	}
+	// notBound is a helper that replies and signals the handler to return early.
+	notBound := func() {
+		b.send(chatID, "请先将此群关联到项目，在项目设置页选择此群。")
+	}
+	// injectProject returns the project name to use: explicit args take priority;
+	// falls back to the bound group project when in a group with no explicit arg.
+	injectProject := func(explicit string) (string, bool) {
+		if explicit != "" {
+			return explicit, true
+		}
+		if !isPrivate {
+			if boundProject == "" {
+				notBound()
+				return "", false
+			}
+			return boundProject, true
+		}
+		return "", true // private: empty is fine, let the handler resolve
 	}
 
 	switch cmd { //nolint:gocritic
@@ -188,24 +229,58 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 	case "status":
 		b.cmdStatus(ctx, chatID, senderID)
 	case "issues":
-		b.cmdIssues(ctx, chatID, senderID, args)
-	case "issue":
-		// In groups, resolve sender by msg.From.ID (private chat ID == user ID in TG)
-		senderChatID := chatID
-		if msg.Chat.Type != "private" && msg.From != nil {
-			senderChatID = msg.From.ID
+		proj, ok := injectProject(args)
+		if !ok {
+			return
 		}
-		b.cmdSubmitIssue(ctx, chatID, senderChatID, args, msg)
+		b.cmdIssues(ctx, chatID, senderID, proj)
+	case "issue":
+		issueArgs := args
+		if !isPrivate && boundProject != "" {
+			// Allow /issue <description> without project name in a bound group.
+			issueArgs = boundProject + " " + args
+		} else if !isPrivate && boundProject == "" {
+			notBound()
+			return
+		}
+		b.cmdSubmitIssue(ctx, chatID, senderID, issueArgs, msg)
 	case "run":
-		b.cmdRun(ctx, chatID, senderID, args)
+		runArgs := args
+		if !isPrivate {
+			parts := strings.Fields(args)
+			if len(parts) == 1 { // agent provided but no project
+				if boundProject == "" {
+					notBound()
+					return
+				}
+				runArgs = parts[0] + " " + boundProject
+			}
+		}
+		b.cmdRun(ctx, chatID, senderID, runArgs)
 	case "fix":
-		b.cmdRunAlias(ctx, chatID, senderID, args, "fix")
+		proj, ok := injectProject(args)
+		if !ok {
+			return
+		}
+		b.cmdRunAlias(ctx, chatID, senderID, proj, "fix")
 	case "explore":
-		b.cmdRunAlias(ctx, chatID, senderID, args, "explore")
+		proj, ok := injectProject(args)
+		if !ok {
+			return
+		}
+		b.cmdRunAlias(ctx, chatID, senderID, proj, "explore")
 	case "pause":
-		b.cmdSetStatus(ctx, chatID, senderID, args, "paused")
+		proj, ok := injectProject(args)
+		if !ok {
+			return
+		}
+		b.cmdSetStatus(ctx, chatID, senderID, proj, "paused")
 	case "resume":
-		b.cmdSetStatus(ctx, chatID, senderID, args, "active")
+		proj, ok := injectProject(args)
+		if !ok {
+			return
+		}
+		b.cmdSetStatus(ctx, chatID, senderID, proj, "active")
 	default:
 		b.send(chatID, "未知命令。支持: /status /issues /issue /fix /explore /run /pause /resume")
 	}
@@ -596,6 +671,45 @@ func (b *Bot) cmdSubmitIssue(ctx context.Context, chatID, senderChatID int64, ar
 		return
 	}
 
+	// Compute title and hash early so we can check for duplicates before the slow AI step.
+	issueTitle := rawDesc
+	if nl := strings.IndexByte(rawDesc, '\n'); nl > 0 {
+		issueTitle = strings.TrimSpace(rawDesc[:nl])
+	}
+	if len(issueTitle) > 120 {
+		issueTitle = issueTitle[:120]
+	}
+	titleHash := fmt.Sprintf("%x", sha1.Sum([]byte(issueTitle)))
+
+	// Duplicate detection: check if an issue with the same title already exists.
+	var existingID int64
+	var existingGHNumber int
+	var existingStatus string
+	if err := b.db.QueryRowContext(ctx,
+		`SELECT id, github_number, status FROM issues WHERE project_id = ? AND title_hash = ? LIMIT 1`,
+		projectID, titleHash,
+	).Scan(&existingID, &existingGHNumber, &existingStatus); err == nil {
+		// Issue already exists — tell the user and offer to reopen if closed.
+		ghURL := fmt.Sprintf("https://github.com/%s/%s/issues/%d",
+			pcfg.IssueTracker.Owner, pcfg.IssueTracker.Repo, existingGHNumber)
+		switch existingStatus {
+		case "open", "fixing":
+			b.send(chatID, fmt.Sprintf("⚠️ 该问题已存在（#%d）且仍在处理中：\n%s", existingGHNumber, ghURL))
+		default:
+			// Closed / needs-human — ask if the user wants to reopen.
+			text := fmt.Sprintf("⚠️ 该问题已存在（#%d）：\n%s\n\n是否重新打开？", existingGHNumber, ghURL)
+			msg := tgbotapi.NewMessage(chatID, text)
+			msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+				tgbotapi.NewInlineKeyboardRow(
+					tgbotapi.NewInlineKeyboardButtonData("✅ 重新打开", fmt.Sprintf("reopen:%d", existingID)),
+					tgbotapi.NewInlineKeyboardButtonData("❌ 取消", "cancel"),
+				),
+			)
+			_, _ = b.api.Send(msg)
+		}
+		return
+	}
+
 	// Decrypt AI key early so we can determine the runner type before starting I/O.
 	aiAPIKey, _ := b.decryptHexStr(pcfg.AIAPIKey)
 	model := pcfg.AIModel
@@ -729,26 +843,17 @@ func (b *Bot) cmdSubmitIssue(ctx context.Context, chatID, senderChatID int64, ar
 		issueBody = fmt.Sprintf("由 Telegram 用户通过 FixLoop Bot 提交。\n\n---\n%s", rawDesc)
 	}
 
-	title := rawDesc
-	if nl := strings.IndexByte(rawDesc, '\n'); nl > 0 {
-		title = strings.TrimSpace(rawDesc[:nl])
-	}
-	if len(title) > 120 {
-		title = title[:120]
-	}
-
-	issue, err := gh.CreateIssue(ctx, pcfg.IssueTracker.Owner, pcfg.IssueTracker.Repo, title, issueBody, []string{"bug"})
+	issue, err := gh.CreateIssue(ctx, pcfg.IssueTracker.Owner, pcfg.IssueTracker.Repo, issueTitle, issueBody, []string{"bug"})
 	if err != nil {
 		slog.Warn("tgbot: create github issue failed", "err", err)
 		b.send(chatID, fmt.Sprintf("❌ 创建 GitHub Issue 失败：%v", err))
 		return
 	}
 
-	hash := fmt.Sprintf("%x", sha1.Sum([]byte(title)))
 	_, _ = b.db.ExecContext(ctx,
 		`INSERT IGNORE INTO issues (project_id, github_number, title, title_hash, priority, status)
 		 VALUES (?, ?, ?, ?, 2, 'open')`,
-		projectID, issue.Number, title, hash,
+		projectID, issue.Number, issueTitle, titleHash,
 	)
 
 	b.send(chatID, fmt.Sprintf("✅ Issue #%d 已创建并附上 AI 分析报告：\n%s", issue.Number, issue.HTMLURL))
@@ -853,6 +958,22 @@ func (b *Bot) chatToUserID(ctx context.Context, chatID int64) int64 {
 	return userID
 }
 
+// resolveGroupProject returns the project name bound to the given group chat ID,
+// or "" if no project has this chat configured as its notification target.
+func (b *Bot) resolveGroupProject(ctx context.Context, groupChatID int64) string {
+	if b.db == nil {
+		return ""
+	}
+	var name string
+	_ = b.db.QueryRowContext(ctx,
+		`SELECT name FROM projects
+		 WHERE CAST(JSON_EXTRACT(config, '$.tg_chat_id') AS SIGNED) = ?
+		   AND deleted_at IS NULL LIMIT 1`,
+		groupChatID,
+	).Scan(&name)
+	return name
+}
+
 func (b *Bot) send(chatID int64, text string) {
 	if _, err := b.api.Send(tgbotapi.NewMessage(chatID, text)); err != nil {
 		slog.Warn("tgbot: send failed", "chat_id", chatID, "err", err)
@@ -872,6 +993,87 @@ func (b *Bot) saveOffset(ctx context.Context, offset int) {
 		 ON DUPLICATE KEY UPDATE value = VALUES(value)`,
 		strconv.Itoa(offset),
 	)
+}
+
+// handleCallback processes Telegram inline keyboard button presses.
+func (b *Bot) handleCallback(ctx context.Context, cq *tgbotapi.CallbackQuery) {
+	// Acknowledge the callback immediately to remove the loading spinner.
+	_, _ = b.api.Request(tgbotapi.NewCallback(cq.ID, ""))
+
+	chatID := cq.Message.Chat.ID
+	msgID := cq.Message.MessageID
+	editText := func(text string) {
+		edit := tgbotapi.NewEditMessageText(chatID, msgID, text)
+		edit.ReplyMarkup = nil
+		_, _ = b.api.Send(edit)
+	}
+
+	switch {
+	case cq.Data == "cancel":
+		editText("❌ 已取消。")
+
+	case strings.HasPrefix(cq.Data, "reopen:"):
+		issueIDStr := strings.TrimPrefix(cq.Data, "reopen:")
+		issueID, err := strconv.ParseInt(issueIDStr, 10, 64)
+		if err != nil {
+			return
+		}
+
+		// Load issue and project config from DB.
+		var githubNumber int
+		var projectID int64
+		if err := b.db.QueryRowContext(ctx,
+			`SELECT github_number, project_id FROM issues WHERE id = ?`, issueID,
+		).Scan(&githubNumber, &projectID); err != nil {
+			editText("❌ 找不到该工单，可能已被删除。")
+			return
+		}
+
+		var cfgJSON string
+		if err := b.db.QueryRowContext(ctx,
+			`SELECT config FROM projects WHERE id = ? AND deleted_at IS NULL`, projectID,
+		).Scan(&cfgJSON); err != nil {
+			editText("❌ 找不到项目配置。")
+			return
+		}
+
+		var pcfg struct {
+			GitHub struct {
+				Owner string `json:"owner"`
+				Repo  string `json:"repo"`
+				PAT   string `json:"pat"`
+			} `json:"github"`
+			IssueTracker struct {
+				Owner string `json:"owner"`
+				Repo  string `json:"repo"`
+			} `json:"issue_tracker"`
+		}
+		if err := json.Unmarshal([]byte(cfgJSON), &pcfg); err != nil {
+			editText("❌ 项目配置解析失败。")
+			return
+		}
+		owner := pcfg.IssueTracker.Owner
+		repo := pcfg.IssueTracker.Repo
+
+		pat, err := b.decryptHexStr(pcfg.GitHub.PAT)
+		if err != nil || pat == "" {
+			editText("❌ PAT 解密失败，请在项目设置页检查 GitHub 配置。")
+			return
+		}
+
+		gh := githubclient.New(pat)
+		if err := gh.ReopenIssue(ctx, owner, repo, githubNumber); err != nil {
+			editText(fmt.Sprintf("❌ 重新打开失败：%v", err))
+			return
+		}
+
+		_, _ = b.db.ExecContext(ctx,
+			`UPDATE issues SET status = 'open', fix_attempts = 0 WHERE id = ?`, issueID,
+		)
+
+		ghURL := fmt.Sprintf("https://github.com/%s/%s/issues/%d", owner, repo, githubNumber)
+		editText(fmt.Sprintf("✅ Issue #%d 已重新打开：\n%s", githubNumber, ghURL))
+	}
 }
 
 func (b *Bot) upsertKnownChat(ctx context.Context, chatID int64, title, chatType string, active int) {
