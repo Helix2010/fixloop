@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -114,7 +115,11 @@ func (h *AdminHandler) VerifyTGToken(c *gin.Context) {
 		return
 	}
 
-	resp, err := http.Get(fmt.Sprintf("https://api.telegram.org/bot%s/getMe", req.BotToken))
+	tgCtx, tgCancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer tgCancel()
+	tgReq, _ := http.NewRequestWithContext(tgCtx, http.MethodGet,
+		fmt.Sprintf("https://api.telegram.org/bot%s/getMe", req.BotToken), nil)
+	resp, err := http.DefaultClient.Do(tgReq)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"code": "TG_UNREACHABLE", "message": "无法连接 Telegram API，请检查网络"}})
 		return
@@ -188,14 +193,21 @@ var (
 
 func workspaceStat(dir string) workspaceInfo {
 	wsCacheMu.Lock()
-	defer wsCacheMu.Unlock()
 	if dir == wsCacheDir && time.Now().Before(wsCacheExp) {
-		return wsCache
+		cached := wsCache
+		wsCacheMu.Unlock()
+		return cached
 	}
+	wsCacheMu.Unlock()
+
+	// Compute outside the lock — dirSize walks the whole tree and can be slow.
 	info := computeWorkspaceStat(dir)
+
+	wsCacheMu.Lock()
 	wsCache = info
 	wsCacheDir = dir
 	wsCacheExp = time.Now().Add(5 * time.Minute)
+	wsCacheMu.Unlock()
 	return info
 }
 
@@ -254,7 +266,7 @@ func (h *AdminHandler) GetTGChats(c *gin.Context) {
 		 WHERE k.active = 1
 		 ORDER BY k.title`)
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"data": []tgChatResp{}})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
 		return
 	}
 	defer rows.Close()

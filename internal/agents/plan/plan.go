@@ -17,6 +17,7 @@ import (
 	_ "embed"
 
 	"github.com/fixloop/fixloop/internal/agentrun"
+	"github.com/fixloop/fixloop/internal/agents/shared"
 	"github.com/fixloop/fixloop/internal/config"
 	"github.com/fixloop/fixloop/internal/crypto"
 	"github.com/fixloop/fixloop/internal/runner"
@@ -70,12 +71,16 @@ func (a *Agent) Run(ctx context.Context, projectID int64, projectAgentID int64) 
 	// Load from project_agents
 	var planEnabled bool
 	var promptOverrideDB, rulesDB sql.NullString
+	var dailyLimit int
 	err := a.DB.QueryRowContext(ctx,
-		`SELECT enabled, prompt_override, rules FROM project_agents WHERE id = ?`, projectAgentID,
-	).Scan(&planEnabled, &promptOverrideDB, &rulesDB)
+		`SELECT enabled, prompt_override, rules, daily_limit FROM project_agents WHERE id = ?`, projectAgentID,
+	).Scan(&planEnabled, &promptOverrideDB, &rulesDB, &dailyLimit)
 	if err == nil && !planEnabled {
 		slog.Info("plan: agent disabled in project_agents, skipping", "project_id", projectID)
 		return
+	}
+	if dailyLimit <= 0 {
+		dailyLimit = 10
 	}
 
 	var cfgJSON string
@@ -95,6 +100,11 @@ func (a *Agent) Run(ctx context.Context, projectID int64, projectAgentID int64) 
 	var pcfg projectConf
 	if err := json.Unmarshal([]byte(cfgJSON), &pcfg); err != nil {
 		slog.Error("plan: parse config", "project_id", projectID, "err", err)
+		return
+	}
+
+	if shared.ExceedsDailyLimit(ctx, a.DB, projectID, "plan", dailyLimit) {
+		slog.Info("plan: daily run limit reached", "project_id", projectID)
 		return
 	}
 
@@ -131,13 +141,13 @@ func (a *Agent) runPlan(ctx context.Context, projectID, runID int64, pcfg *proje
 	if err := a.DB.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM backlog WHERE project_id = ? AND status = 'pending'`, projectID,
 	).Scan(&pendingCount); err != nil {
-		logf("ERROR: count pending backlog: %v", err)
+		logf("错误：统计待测场景失败：%v", err)
 		return logBuf.String(), "failed"
 	}
 
 	// Skip if backlog is healthy
 	if pendingCount > 10 {
-		logf("backlog healthy (%d pending), skipping", pendingCount)
+		logf("测试背板充足（%d 条待测），跳过本次规划", pendingCount)
 		return logBuf.String(), "skipped"
 	}
 
@@ -179,7 +189,7 @@ func (a *Agent) runPlan(ctx context.Context, projectID, runID int64, pcfg *proje
 	if promptOverride != "" {
 		t, err := template.New("plan_override").Parse(promptOverride)
 		if err != nil {
-			logf("WARN: parse plan prompt override: %v — using default", err)
+			logf("警告：解析自定义 Prompt 失败：%v，使用默认配置", err)
 		} else {
 			activeTmpl = t
 		}
@@ -193,7 +203,7 @@ func (a *Agent) runPlan(ctx context.Context, projectID, runID int64, pcfg *proje
 		RecentIssues: strings.Join(issueLines, "\n"),
 		Count:        want,
 	}); err != nil {
-		logf("ERROR: build prompt: %v", err)
+		logf("错误：构建提示词失败：%v", err)
 		return logBuf.String(), "failed"
 	}
 	if rules != "" {
@@ -202,7 +212,7 @@ func (a *Agent) runPlan(ctx context.Context, projectID, runID int64, pcfg *proje
 	}
 	prompt := buf.String()
 
-	logf("generating %d new backlog scenarios via AI", want)
+	logf("AI 生成 %d 条新测试场景", want)
 
 	r, err := runner.New(pcfg.AIRunner, model, pcfg.AIAPIBase, apiKey)
 	if err != nil {
@@ -211,14 +221,14 @@ func (a *Agent) runPlan(ctx context.Context, projectID, runID int64, pcfg *proje
 	aiOut, err := r.Run(ctx, "", prompt)
 	logBuf.WriteString("\n--- AI OUTPUT ---\n" + aiOut + "\n---\n")
 	if err != nil {
-		logf("ERROR: AI runner: %v", err)
+		logf("错误：AI 运行失败：%v", err)
 		return logBuf.String(), "failed"
 	}
 
 	// Parse JSON array from response
 	suggestions, err := parseScenarios(aiOut)
 	if err != nil {
-		logf("WARN: parse scenarios: %v", err)
+		logf("警告：解析场景失败：%v", err)
 		return logBuf.String(), "failed"
 	}
 
@@ -241,13 +251,13 @@ func (a *Agent) runPlan(ctx context.Context, projectID, runID int64, pcfg *proje
 			projectID, s.Title, hash, s.Description, s.ScenarioType, s.Priority,
 		)
 		if err != nil {
-			logf("WARN: insert backlog row: %v", err)
+			logf("警告：插入场景记录失败：%v", err)
 			continue
 		}
 		inserted++
 	}
 
-	logf("inserted %d new backlog scenarios", inserted)
+	logf("已插入 %d 条新测试场景", inserted)
 	return logBuf.String(), "success"
 }
 

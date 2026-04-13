@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,9 +15,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/fixloop/fixloop/internal/api/middleware"
 	"github.com/fixloop/fixloop/internal/config"
+	"github.com/fixloop/fixloop/internal/util"
+	"github.com/gin-gonic/gin"
 )
 
 type AuthHandler struct {
@@ -96,10 +98,7 @@ func (h *AuthHandler) GitHubCallback(c *gin.Context) {
 		return
 	}
 
-	redirect := c.Query("redirect")
-	if redirect == "" || !strings.HasPrefix(redirect, "/") {
-		redirect = "/dashboard"
-	}
+	redirect := sanitizeRedirect(c.Query("redirect"))
 	c.Redirect(http.StatusFound, redirect)
 }
 
@@ -153,18 +152,33 @@ func (h *AuthHandler) TGBind(c *gin.Context) {
 		return
 	}
 	userID := c.MustGet("user_id").(int64)
+	ctx := c.Request.Context()
 
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
+	// Rate-limit: max 5 active bind tokens per user per hour.
+	var activeTokens int
+	_ = h.DB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM system_config
+		 WHERE key_name LIKE 'tg_bind_%' AND value = ? AND updated_at > NOW() - INTERVAL 1 HOUR`,
+		fmt.Sprintf("%d", userID),
+	).Scan(&activeTokens)
+	if activeTokens >= 5 {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": gin.H{
+			"code": "RATE_LIMITED", "message": "绑定请求过于频繁，请稍后再试",
+		}})
+		return
+	}
+
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{
 			"code": "RAND_ERROR", "message": "生成 token 失败",
 		}})
 		return
 	}
-	token := fmt.Sprintf("%x", b)
-	key := "tg_bind_" + token
+	token := hex.EncodeToString(raw) // plaintext token returned to user
+	key := util.TGBindKey(raw)       // store hash, not plaintext
 
-	_, err := h.DB.ExecContext(c.Request.Context(),
+	_, err := h.DB.ExecContext(ctx,
 		`INSERT INTO system_config (key_name, value) VALUES (?, ?)
 		 ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = NOW()`,
 		key, fmt.Sprintf("%d", userID),
@@ -265,4 +279,26 @@ func generateState() string {
 	b := make([]byte, 24)
 	rand.Read(b)
 	return base64.URLEncoding.EncodeToString(b)
+}
+
+// allowedRedirects is the whitelist of safe post-login destinations.
+var allowedRedirects = map[string]bool{
+	"/dashboard": true,
+	"/projects":  true,
+	"/admin":     true,
+	"/settings":  true,
+}
+
+// sanitizeRedirect returns path if it is in the whitelist, otherwise "/dashboard".
+// This prevents open-redirect attacks via the OAuth callback redirect param.
+func sanitizeRedirect(path string) string {
+	// Strip query/fragment — only the bare path is whitelisted.
+	clean := path
+	if i := strings.IndexAny(clean, "?#"); i >= 0 {
+		clean = clean[:i]
+	}
+	if allowedRedirects[clean] {
+		return clean // return sanitized path, never the raw input
+	}
+	return "/dashboard"
 }

@@ -95,8 +95,8 @@ func (s *Scheduler) RemoveProject(projectID int64) {
 }
 
 // LoadActiveProjects registers jobs for all active projects. Call once on startup.
-func (s *Scheduler) LoadActiveProjects(db *sql.DB) error {
-	rows, err := db.Query(
+func (s *Scheduler) LoadActiveProjects() error {
+	rows, err := s.db.Query(
 		`SELECT id FROM projects WHERE status = 'active' AND deleted_at IS NULL`,
 	)
 	if err != nil {

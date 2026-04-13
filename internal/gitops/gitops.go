@@ -169,7 +169,9 @@ func writeTempKey(sshKey []byte) (string, error) {
 }
 
 func sshCommand(keyFile string) string {
-	return fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o IdentitiesOnly=yes -o BatchMode=yes", keyFile)
+	// StrictHostKeyChecking=accept-new: accept unknown hosts on first connect,
+	// reject changed host keys (prevents MITM against known hosts).
+	return fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o BatchMode=yes", keyFile)
 }
 
 func runGit(ctx context.Context, sshCmd, dir string, args ...string) (string, error) {

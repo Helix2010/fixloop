@@ -138,6 +138,7 @@ function Settings({ user: _user }: { user: User }) {
   }, []);
 
   useEffect(() => {
+    loadTgChats();
     apiFetch<SingleResponse<Project>>(`/api/v1/projects/${id}`)
       .then((r) => {
         const p = r.data;
@@ -542,17 +543,26 @@ function Settings({ user: _user }: { user: User }) {
                 <select className={inputClass} value={form.ai_runner} onChange={handleRunnerChange}>
                   <option value="claude">Claude（推荐）</option>
                   <option value="aider">Aider</option>
+                  <option value="gemini">Gemini</option>
                 </select>
               </Field>
               <Field
                 label="模型"
-                hint={form.ai_runner === 'claude' ? '留空使用默认 claude-opus-4-6' : '例如 deepseek-chat、gpt-4o'}
+                hint={
+                  form.ai_runner === 'claude' ? '留空使用默认 claude-opus-4-6' :
+                  form.ai_runner === 'gemini' ? '留空使用默认 gemini-2.5-pro' :
+                  '例如 deepseek-chat、gpt-4o'
+                }
               >
                 <input
                   className={inputClass}
                   value={form.ai_model}
                   onChange={set('ai_model')}
-                  placeholder={form.ai_runner === 'claude' ? 'claude-opus-4-6' : 'gpt-4o'}
+                  placeholder={
+                    form.ai_runner === 'claude' ? 'claude-opus-4-6' :
+                    form.ai_runner === 'gemini' ? 'gemini-2.5-pro' :
+                    'gpt-4o'
+                  }
                 />
               </Field>
             </div>
@@ -573,6 +583,14 @@ function Settings({ user: _user }: { user: User }) {
                   <input className={inputClass} type="password" value={form.ai_api_key} onChange={set('ai_api_key')} placeholder="••••••••" />
                 </Field>
               </>
+            )}
+            {form.ai_runner === 'gemini' && (
+              <Field
+                label="Gemini API 密钥（可选）"
+                hint="留空则使用服务器 GEMINI_API_KEY 环境变量。加密存储。"
+              >
+                <input className={inputClass} type="password" value={form.ai_api_key} onChange={set('ai_api_key')} placeholder="AIza...（留空不修改）" />
+              </Field>
             )}
           </Section>
 
@@ -806,7 +824,7 @@ function Settings({ user: _user }: { user: User }) {
                             setShowNewAgentForm(false);
                             setNewAgent({ name: '', alias: '', prompt_override: '', rules: '', schedule_minutes: 60 });
                           } catch (e) {
-                            alert(e instanceof Error ? e.message : '创建失败');
+                            setError(e instanceof Error ? e.message : '创建失败');
                           } finally {
                             setNewAgentSaving(false);
                           }
@@ -1000,31 +1018,6 @@ function Section({ id, label, desc, children, sectionRefs, danger }: SectionProp
   );
 }
 
-type AgentToggleProps = {
-  label: string;
-  desc: string;
-  checked: boolean;
-  onChange: (v: boolean) => void;
-};
-
-function AgentToggle({ label, desc, checked, onChange }: AgentToggleProps) {
-  return (
-    <div className={`flex items-start justify-between gap-4 p-4 rounded-lg border transition-colors ${checked ? 'border-gray-200 bg-gray-50' : 'border-gray-200 bg-white opacity-60'}`}>
-      <div className="flex-1 min-w-0">
-        <p className="text-sm font-medium text-gray-700">{label}</p>
-        <p className="text-xs text-gray-400 mt-0.5 leading-relaxed">{desc}</p>
-      </div>
-      <button
-        type="button"
-        onClick={() => onChange(!checked)}
-        className={`relative flex-shrink-0 w-10 h-6 rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-1 ${checked ? 'bg-blue-500' : 'bg-gray-300'}`}
-        aria-pressed={checked}
-      >
-        <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow-sm transition-transform ${checked ? 'translate-x-4' : 'translate-x-0'}`} />
-      </button>
-    </div>
-  );
-}
 
 function SubLabel({ children, top }: { children: React.ReactNode; top?: boolean }) {
   return (
@@ -1388,6 +1381,7 @@ function WebhookTokenSection({
   const [adding, setAdding] = useState(false);
   const [newToken, setNewToken] = useState<string | null>(null); // shown once only
   const [copied, setCopied] = useState(false);
+  const [tokenError, setTokenError] = useState('');
 
   const copy = (text: string) => {
     navigator.clipboard.writeText(text).then(() => {
@@ -1408,7 +1402,7 @@ function WebhookTokenSection({
       setNewToken(new_token);
       setCopied(false);
     } catch (e) {
-      alert(e instanceof Error ? e.message : '操作失败');
+      setTokenError(e instanceof Error ? e.message : '操作失败');
     } finally {
       setAdding(false);
     }
@@ -1425,7 +1419,7 @@ function WebhookTokenSection({
           await apiFetch(`/api/v1/projects/${projectId}/webhook-tokens/${tokenId}`, { method: 'DELETE' });
           onRemove(tokenId);
         } catch (e) {
-          alert(e instanceof Error ? e.message : '操作失败');
+          setTokenError(e instanceof Error ? e.message : '操作失败');
         }
       },
     });
@@ -1457,6 +1451,10 @@ function WebhookTokenSection({
           )}
         </button>
       </div>
+
+      {tokenError && (
+        <p className="text-xs text-red-500">{tokenError}</p>
+      )}
 
       {/* One-time reveal panel — shown immediately after creation */}
       {newToken && (

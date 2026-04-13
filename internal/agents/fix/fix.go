@@ -17,6 +17,7 @@ import (
 	_ "embed"
 
 	"github.com/fixloop/fixloop/internal/agentrun"
+	"github.com/fixloop/fixloop/internal/agents/shared"
 	"github.com/fixloop/fixloop/internal/config"
 	"github.com/fixloop/fixloop/internal/crypto"
 	githubclient "github.com/fixloop/fixloop/internal/github"
@@ -110,12 +111,16 @@ func (a *Agent) Run(ctx context.Context, projectID int64, projectAgentID int64) 
 	// Load from project_agents
 	var fixEnabled bool
 	var promptOverrideDB, rulesDB sql.NullString
+	var dailyLimit int
 	err := a.DB.QueryRowContext(ctx,
-		`SELECT enabled, prompt_override, rules FROM project_agents WHERE id = ?`, projectAgentID,
-	).Scan(&fixEnabled, &promptOverrideDB, &rulesDB)
+		`SELECT enabled, prompt_override, rules, daily_limit FROM project_agents WHERE id = ?`, projectAgentID,
+	).Scan(&fixEnabled, &promptOverrideDB, &rulesDB, &dailyLimit)
 	if err == nil && !fixEnabled {
 		slog.Info("fix: agent disabled in project_agents, skipping", "project_id", projectID)
 		return
+	}
+	if dailyLimit <= 0 {
+		dailyLimit = 30
 	}
 
 	var (
@@ -144,14 +149,8 @@ func (a *Agent) Run(ctx context.Context, projectID int64, projectAgentID int64) 
 		return
 	}
 
-	// Daily run limit: 30 runs per 24h
-	var runCount int
-	_ = a.DB.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM agent_runs
-		 WHERE project_id = ? AND agent_type = 'fix' AND started_at > NOW() - INTERVAL 24 HOUR`,
-		projectID,
-	).Scan(&runCount)
-	if runCount >= 30 {
+	// Daily run limit
+	if shared.ExceedsDailyLimit(ctx, a.DB, projectID, "fix", dailyLimit) {
 		slog.Info("fix: daily run limit reached", "project_id", projectID)
 		return
 	}
@@ -201,13 +200,13 @@ func (a *Agent) runFix(ctx context.Context, projectID, userID, runID int64, issu
 	// Decrypt SSH key
 	sshKeyEnc, err := hex.DecodeString(pcfg.SSHPrivateKey)
 	if err != nil {
-		logf("ERROR: decode ssh key hex: %v", err)
+		logf("错误：SSH 密钥解码失败：%v", err)
 		a.releaseIssue(ctx, issue.id)
 		return logBuf.String(), "failed"
 	}
 	sshKey, err := crypto.Decrypt(map[byte][]byte{a.Cfg.AESKeyID: a.Cfg.AESKey}, sshKeyEnc)
 	if err != nil {
-		logf("ERROR: decrypt ssh key: %v", err)
+		logf("错误：SSH 密钥解密失败：%v", err)
 		a.releaseIssue(ctx, issue.id)
 		return logBuf.String(), "failed"
 	}
@@ -215,13 +214,13 @@ func (a *Agent) runFix(ctx context.Context, projectID, userID, runID int64, issu
 	// Decrypt PAT
 	patEnc, err := hex.DecodeString(pcfg.GitHub.PAT)
 	if err != nil {
-		logf("ERROR: decode PAT hex: %v", err)
+		logf("错误：PAT 解码失败：%v", err)
 		a.releaseIssue(ctx, issue.id)
 		return logBuf.String(), "failed"
 	}
 	pat, err := crypto.Decrypt(map[byte][]byte{a.Cfg.AESKeyID: a.Cfg.AESKey}, patEnc)
 	if err != nil {
-		logf("ERROR: decrypt PAT: %v", err)
+		logf("错误：PAT 解密失败：%v", err)
 		a.releaseIssue(ctx, issue.id)
 		return logBuf.String(), "failed"
 	}
@@ -232,19 +231,19 @@ func (a *Agent) runFix(ctx context.Context, projectID, userID, runID int64, issu
 	}
 
 	repoPath := gitops.AgentRepoPath(a.Cfg.WorkspaceDir, pcfg.GitHub.Owner, pcfg.GitHub.Repo, "fix")
-	logf("ensuring repo at %s", repoPath)
+	logf("准备本地仓库：%s", repoPath)
 
 	if err := gitops.EnsureRepo(ctx, sshKey, pcfg.GitHub.Owner, pcfg.GitHub.Repo, repoPath, baseBranch); err != nil {
-		logf("ERROR: ensure repo: %v", err)
+		logf("错误：仓库初始化失败：%v", err)
 		a.releaseIssue(ctx, issue.id)
 		return logBuf.String(), "failed"
 	}
 
 	branchName := fmt.Sprintf("fix/issue-%d", issue.githubNumber)
-	logf("ensuring branch %s", branchName)
+	logf("切换到分支：%s", branchName)
 
 	if err := gitops.EnsureBranch(ctx, sshKey, repoPath, branchName, baseBranch); err != nil {
-		logf("ERROR: ensure branch: %v", err)
+		logf("错误：分支切换失败：%v", err)
 		a.releaseIssue(ctx, issue.id)
 		return logBuf.String(), "failed"
 	}
@@ -253,7 +252,7 @@ func (a *Agent) runFix(ctx context.Context, projectID, userID, runID int64, issu
 	dirTree := gitops.DirTree(repoPath, 3)
 	prompt, err := buildPrompt(issue.title, "", dirTree, "", promptOverride, fr.promptRules)
 	if err != nil {
-		logf("ERROR: build prompt: %v", err)
+		logf("错误：构建提示词失败：%v", err)
 		a.releaseIssue(ctx, issue.id)
 		return logBuf.String(), "failed"
 	}
@@ -269,19 +268,19 @@ func (a *Agent) runFix(ctx context.Context, projectID, userID, runID int64, issu
 	}
 	r, err := runner.New(pcfg.AIRunner, pcfg.AIModel, pcfg.AIAPIBase, aiAPIKey)
 	if err != nil {
-		logf("ERROR: build runner: %v", err)
+		logf("错误：初始化运行器失败：%v", err)
 		a.releaseIssue(ctx, issue.id)
 		return logBuf.String(), "failed"
 	}
 
-	logf("running AI fix (runner=%s)", pcfg.AIRunner)
+	logf("启动 AI 修复（运行器=%s）", pcfg.AIRunner)
 	fixCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
 
 	aiOutput, err := r.Run(fixCtx, repoPath, prompt)
 	logBuf.WriteString("\n--- AI OUTPUT ---\n" + aiOutput + "\n--- END AI OUTPUT ---\n")
 	if err != nil {
-		logf("ERROR: AI runner: %v", err)
+		logf("错误：AI 运行失败：%v", err)
 		a.releaseIssue(ctx, issue.id)
 		return logBuf.String(), "failed"
 	}
@@ -289,12 +288,12 @@ func (a *Agent) runFix(ctx context.Context, projectID, userID, runID int64, issu
 	// Check if AI made any changes
 	hasChanges, err := gitops.HasChanges(ctx, repoPath)
 	if err != nil {
-		logf("ERROR: check changes: %v", err)
+		logf("错误：检查文件变更失败：%v", err)
 		a.releaseIssue(ctx, issue.id)
 		return logBuf.String(), "failed"
 	}
 	if !hasChanges {
-		logf("AI made no file changes; commenting on issue")
+		logf("AI 未产生任何文件改动，已在 Issue 上留言")
 		gh := githubclient.New(string(pat))
 		_ = gh.AddIssueComment(ctx,
 			pcfg.IssueTracker.Owner, pcfg.IssueTracker.Repo,
@@ -308,29 +307,29 @@ func (a *Agent) runFix(ctx context.Context, projectID, userID, runID int64, issu
 	// Commit and push
 	commitMsg := fmt.Sprintf("fix: %s (#%d)", issue.title, issue.githubNumber)
 	if err := gitops.CommitAll(ctx, repoPath, commitMsg); err != nil {
-		logf("ERROR: commit: %v", err)
+		logf("错误：提交失败：%v", err)
 		a.releaseIssue(ctx, issue.id)
 		return logBuf.String(), "failed"
 	}
 
 	force := issue.fixAttempts > 0
 	if err := gitops.Push(ctx, sshKey, repoPath, branchName, force); err != nil {
-		logf("ERROR: push: %v", err)
+		logf("错误：推送失败：%v", err)
 		a.releaseIssue(ctx, issue.id)
 		return logBuf.String(), "failed"
 	}
-	logf("pushed branch %s (force=%v)", branchName, force)
+	logf("已推送分支 %s（force=%v）", branchName, force)
 
 	// Create or find existing PR
 	gh := githubclient.New(string(pat))
 	existingPR, err := a.findExistingPR(ctx, projectID, issue.id)
 	if err != nil {
-		logf("WARN: find existing PR: %v", err)
+		logf("警告：查找已有 PR 失败：%v", err)
 	}
 
 	var prNumber int
 	if existingPR != 0 {
-		logf("existing PR #%d, skipping create", existingPR)
+		logf("已存在 PR #%d，跳过创建", existingPR)
 		prNumber = existingPR
 	} else {
 		prTitle := fmt.Sprintf("fix: %s (#%d)", issue.title, issue.githubNumber)
@@ -338,15 +337,15 @@ func (a *Agent) runFix(ctx context.Context, projectID, userID, runID int64, issu
 			pcfg.IssueTracker.Owner, pcfg.IssueTracker.Repo, aiOutput)
 		pr, err := gh.CreatePR(ctx, pcfg.GitHub.Owner, pcfg.GitHub.Repo, prTitle, prBody, branchName, baseBranch)
 		if err != nil {
-			logf("ERROR: create PR: %v", err)
+			logf("错误：创建 PR 失败：%v", err)
 			a.releaseIssue(ctx, issue.id)
 			return logBuf.String(), "failed"
 		}
-		logf("created PR #%d", pr.Number)
+		logf("已创建 PR #%d", pr.Number)
 		prNumber = pr.Number
 
 		if err := gh.RequestCopilotReview(ctx, pcfg.GitHub.Owner, pcfg.GitHub.Repo, prNumber); err != nil {
-			logf("WARN: request copilot review: %v", err)
+			logf("警告：请求 Copilot review 失败：%v", err)
 		}
 
 		if _, err := a.DB.ExecContext(ctx,
@@ -355,7 +354,7 @@ func (a *Agent) runFix(ctx context.Context, projectID, userID, runID int64, issu
 			 ON DUPLICATE KEY UPDATE status='open', title=VALUES(title)`,
 			projectID, issue.id, prNumber, branchName, prTitle,
 		); err != nil {
-			logf("WARN: insert prs: %v", err)
+			logf("警告：插入 PR 记录失败：%v", err)
 		}
 	}
 
@@ -364,7 +363,7 @@ func (a *Agent) runFix(ctx context.Context, projectID, userID, runID int64, issu
 		`UPDATE issues SET fix_attempts = fix_attempts + 1 WHERE id = ?`,
 		issue.id,
 	); err != nil {
-		logf("WARN: update fix_attempts: %v", err)
+		logf("警告：更新修复次数失败：%v", err)
 	}
 
 	// Check if needs-human (configurable via MAX_ATTEMPTS rule, default 3)
@@ -373,14 +372,14 @@ func (a *Agent) runFix(ctx context.Context, projectID, userID, runID int64, issu
 			`UPDATE issues SET status = 'needs-human' WHERE id = ? AND status = 'fixing'`,
 			issue.id,
 		); err != nil {
-			logf("WARN: set needs-human: %v", err)
+			logf("警告：设置需人工状态失败：%v", err)
 		}
 		_ = notify.Send(ctx, a.DB, userID, projectID, "fix_failed",
 			fmt.Sprintf("⚠️ Issue #%d 修复失败 %d 次，需人工介入: %s", issue.githubNumber, issue.fixAttempts+1, issue.title),
 		)
 	}
 
-	logf("fix-agent complete, PR #%d", prNumber)
+	logf("修复完成，PR #%d", prNumber)
 	return logBuf.String(), "success"
 }
 

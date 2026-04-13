@@ -7,7 +7,7 @@ import AuthGuard from '@/components/AuthGuard';
 import Pagination from '@/components/Pagination';
 import { Spinner, PageSpinner, Empty } from '@/components/ui';
 import { apiFetch, ApiError } from '@/lib/api';
-import { fmtDate, fmtTimeAgo, fmtDuration, runStatusColor, runStatusLabel, issueStatusLabel, prStatusLabel, projectStatusLabel } from '@/lib/utils';
+import { fmtDate, fmtTimeAgo, fmtDuration, runStatusColor, runStatusLabel, issueStatusLabel, issueStatusColor, prStatusLabel, prStatusColor, projectStatusLabel } from '@/lib/utils';
 import type {
   User,
   Project,
@@ -15,6 +15,7 @@ import type {
   PR,
   BacklogItem,
   AgentRun,
+  ProjectAgent,
   PagedResponse,
   SingleResponse,
 } from '@/lib/types';
@@ -111,8 +112,8 @@ function ProjectDetail({ user: _user }: { user: User }) {
           ))}
         </div>
 
-        {tab === 'issues' && <IssuesTab projectId={id} />}
-        {tab === 'prs' && <PRsTab projectId={id} />}
+        {tab === 'issues' && <IssuesTab projectId={id} project={project} />}
+        {tab === 'prs' && <PRsTab projectId={id} project={project} />}
         {tab === 'backlog' && <BacklogTab projectId={id} />}
         {tab === 'runs' && <RunsTab projectId={id} />}
       </div>
@@ -120,11 +121,13 @@ function ProjectDetail({ user: _user }: { user: User }) {
   );
 }
 
-function IssuesTab({ projectId }: { projectId: string }) {
+function IssuesTab({ projectId, project }: { projectId: string; project: Project }) {
   const [issues, setIssues] = useState<Issue[]>([]);
   const [page, setPage] = useState(1);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
+
+  const { owner, repo } = project.issue_tracker;
 
   const load = useCallback(async (p: number) => {
     setLoading(true);
@@ -148,30 +151,45 @@ function IssuesTab({ projectId }: { projectId: string }) {
   return (
     <div>
       <div className="bg-white rounded-xl border border-gray-200 divide-y divide-gray-100">
-        {issues.map((i) => (
-          <div key={i.id} className={`px-5 py-4 flex items-start justify-between gap-4 ${i.status === 'closed' ? 'opacity-60' : ''}`}>
-            <div className="flex-1 min-w-0">
-              <p className={`font-medium text-sm truncate ${i.status === 'closed' ? 'line-through text-gray-400' : ''}`}>{i.title}</p>
-              <p className="text-xs text-gray-400 mt-0.5">
-                #{i.github_number} · 尝试 {i.fix_attempts} 次 · {i.status === 'closed' ? `关闭于 ${fmtDate(i.closed_at)}` : fmtDate(i.created_at)}
-              </p>
+        {issues.map((i) => {
+          const ghUrl = `https://github.com/${owner}/${repo}/issues/${i.github_number}`;
+          return (
+            <div key={i.id} className={`px-5 py-4 flex items-start justify-between gap-4 ${i.status === 'closed' ? 'opacity-60' : ''}`}>
+              <div className="flex-1 min-w-0">
+                <a
+                  href={ghUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className={`font-medium text-sm truncate block hover:underline ${i.status === 'closed' ? 'line-through text-gray-400' : 'text-gray-900'}`}
+                >
+                  {i.title}
+                </a>
+                <p className="text-xs text-gray-400 mt-0.5">
+                  <a href={ghUrl} target="_blank" rel="noopener noreferrer" className="hover:underline">
+                    #{i.github_number}
+                  </a>
+                  {' '}· 尝试 {i.fix_attempts} 次 · {i.status === 'closed' ? `关闭于 ${fmtDate(i.closed_at)}` : fmtDate(i.created_at)}
+                </p>
+              </div>
+              <span className={`text-xs px-2 py-0.5 rounded-full font-medium whitespace-nowrap ${issueStatusColor[i.status] ?? 'bg-gray-100 text-gray-600'}`}>
+                {issueStatusLabel(i.status)}
+              </span>
             </div>
-            <span className={`text-xs px-2 py-0.5 rounded-full font-medium whitespace-nowrap ${ISSUE_STATUS_COLORS[i.status] ?? 'bg-gray-100 text-gray-600'}`}>
-              {issueStatusLabel(i.status)}
-            </span>
-          </div>
-        ))}
+          );
+        })}
       </div>
       <Pagination page={page} total={total} perPage={20} onChange={load} />
     </div>
   );
 }
 
-function PRsTab({ projectId }: { projectId: string }) {
+function PRsTab({ projectId, project }: { projectId: string; project: Project }) {
   const [prs, setPRs] = useState<PR[]>([]);
   const [page, setPage] = useState(1);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
+
+  const { owner, repo } = project.issue_tracker;
 
   const load = useCallback(async (p: number) => {
     setLoading(true);
@@ -195,50 +213,57 @@ function PRsTab({ projectId }: { projectId: string }) {
   return (
     <div>
       <div className="bg-white rounded-xl border border-gray-200 divide-y divide-gray-100">
-        {prs.map((pr) => (
-          <div key={pr.id} className="px-4 py-3 flex items-start gap-3 hover:bg-gray-50/60 transition-colors">
-            {/* Status icon */}
-            <div className="flex-shrink-0 mt-0.5">
-              {pr.status === 'merged' ? (
-                <svg className="w-5 h-5 text-purple-500" viewBox="0 0 16 16" fill="currentColor">
-                  <path d="M5.45 5.154A4.25 4.25 0 0 0 9.25 7.5h1.378a2.251 2.251 0 1 1 0 1.5H9.25A5.734 5.734 0 0 1 5 7.123v3.505a2.25 2.25 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.95-.218ZM4.25 13.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Zm8.5-4.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5ZM5 3.25a.75.75 0 1 0 0 .005V3.25Z" />
-                </svg>
-              ) : pr.status === 'open' ? (
-                <svg className="w-5 h-5 text-green-500" viewBox="0 0 16 16" fill="currentColor">
-                  <path d="M1.5 3.25a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 1.5 3.25Zm5.677-.177L9.573.677A.25.25 0 0 1 10 .854V2.5h1A2.5 2.5 0 0 1 13.5 5v5.628a2.251 2.251 0 1 1-1.5 0V5a1 1 0 0 0-1-1h-1v1.646a.25.25 0 0 1-.427.177L7.177 3.427a.25.25 0 0 1 0-.354ZM3.75 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm0 9.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm8.25.75a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0Z" />
-                </svg>
-              ) : (
-                <svg className="w-5 h-5 text-gray-400" viewBox="0 0 16 16" fill="currentColor">
-                  <path d="M3.25 1A2.25 2.25 0 0 1 4 5.372v5.256a2.25 2.25 0 1 1-1.5 0V5.372A2.251 2.251 0 0 1 3.25 1Zm9.5 14a2.25 2.25 0 1 1 0-4.5 2.25 2.25 0 0 1 0 4.5ZM3.25 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm0 9.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm9.5 0a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Z" />
-                </svg>
-              )}
-            </div>
+        {prs.map((pr) => {
+          const ghUrl = `https://github.com/${owner}/${repo}/pull/${pr.github_number}`;
+          return (
+            <div key={pr.id} className="px-4 py-3 flex items-start gap-3 hover:bg-gray-50/60 transition-colors">
+              {/* Status icon */}
+              <div className="flex-shrink-0 mt-0.5">
+                {pr.status === 'merged' ? (
+                  <svg className="w-5 h-5 text-purple-500" viewBox="0 0 16 16" fill="currentColor">
+                    <path d="M5.45 5.154A4.25 4.25 0 0 0 9.25 7.5h1.378a2.251 2.251 0 1 1 0 1.5H9.25A5.734 5.734 0 0 1 5 7.123v3.505a2.25 2.25 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.95-.218ZM4.25 13.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Zm8.5-4.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5ZM5 3.25a.75.75 0 1 0 0 .005V3.25Z" />
+                  </svg>
+                ) : pr.status === 'open' ? (
+                  <svg className="w-5 h-5 text-green-500" viewBox="0 0 16 16" fill="currentColor">
+                    <path d="M1.5 3.25a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 1.5 3.25Zm5.677-.177L9.573.677A.25.25 0 0 1 10 .854V2.5h1A2.5 2.5 0 0 1 13.5 5v5.628a2.251 2.251 0 1 1-1.5 0V5a1 1 0 0 0-1-1h-1v1.646a.25.25 0 0 1-.427.177L7.177 3.427a.25.25 0 0 1 0-.354ZM3.75 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm0 9.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm8.25.75a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0Z" />
+                  </svg>
+                ) : (
+                  <svg className="w-5 h-5 text-gray-400" viewBox="0 0 16 16" fill="currentColor">
+                    <path d="M3.25 1A2.25 2.25 0 0 1 4 5.372v5.256a2.25 2.25 0 1 1-1.5 0V5.372A2.251 2.251 0 0 1 3.25 1Zm9.5 14a2.25 2.25 0 1 1 0-4.5 2.25 2.25 0 0 1 0 4.5ZM3.25 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm0 9.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm9.5 0a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Z" />
+                  </svg>
+                )}
+              </div>
 
-            {/* Content */}
-            <div className="flex-1 min-w-0">
-              <p className="text-sm font-medium text-gray-900 leading-snug">
-                {pr.title || pr.branch}
-              </p>
-              <p className="text-xs text-gray-500 mt-0.5">
-                {pr.status === 'merged' && pr.merged_by
-                  ? <>#<span className="font-medium">{pr.github_number}</span> by <span className="font-medium">{pr.merged_by}</span> was merged {fmtTimeAgo(pr.merged_at)}</>
-                  : pr.status === 'open'
-                  ? <>#<span className="font-medium">{pr.github_number}</span> opened {fmtTimeAgo(pr.created_at)} · {pr.branch}</>
-                  : <>#<span className="font-medium">{pr.github_number}</span> {prStatusLabel(pr.status)} · {fmtDate(pr.created_at)}</>
-                }
-              </p>
-            </div>
+              {/* Content */}
+              <div className="flex-1 min-w-0">
+                <a
+                  href={ghUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-sm font-medium text-gray-900 leading-snug hover:underline block truncate"
+                >
+                  {pr.title || pr.branch}
+                </a>
+                <p className="text-xs text-gray-500 mt-0.5">
+                  <a href={ghUrl} target="_blank" rel="noopener noreferrer" className="hover:underline">
+                    #{pr.github_number}
+                  </a>
+                  {pr.status === 'merged' && pr.merged_by
+                    ? <> 由 <span className="font-medium">{pr.merged_by}</span> 于 {fmtTimeAgo(pr.merged_at)} 合并</>
+                    : pr.status === 'open'
+                    ? <> {fmtTimeAgo(pr.created_at)} 开启 · {pr.branch}</>
+                    : <> {prStatusLabel(pr.status)} · {fmtDate(pr.created_at)}</>
+                  }
+                </p>
+              </div>
 
-            {/* Status badge */}
-            <span className={`flex-shrink-0 text-xs font-medium px-2 py-0.5 rounded-full ${
-              pr.status === 'merged' ? 'bg-purple-100 text-purple-700' :
-              pr.status === 'open'   ? 'bg-green-100 text-green-700' :
-                                       'bg-gray-100 text-gray-600'
-            }`}>
-              {prStatusLabel(pr.status)}
-            </span>
-          </div>
-        ))}
+              {/* Status badge */}
+              <span className={`flex-shrink-0 text-xs font-medium px-2 py-0.5 rounded-full ${prStatusColor[pr.status] ?? 'bg-gray-100 text-gray-600'}`}>
+                {prStatusLabel(pr.status)}
+              </span>
+            </div>
+          );
+        })}
       </div>
       <Pagination page={page} total={total} perPage={20} onChange={load} />
     </div>
@@ -327,12 +352,6 @@ function BacklogTab({ projectId }: { projectId: string }) {
 
 const AGENT_TYPES = ['explore', 'fix', 'master', 'plan'] as const;
 
-const ISSUE_STATUS_COLORS: Record<string, string> = {
-  open:          'bg-green-100 text-green-700',
-  fixing:        'bg-blue-100 text-blue-700',
-  'needs-human': 'bg-red-100 text-red-700',
-  closed:        'bg-gray-100 text-gray-500',
-};
 
 const AGENT_DESCRIPTIONS: Record<string, { label: string; desc: string; icon: string }> = {
   explore: { label: 'Explore', desc: '扫描代码库，发现潜在问题并创建工单', icon: '🔍' },
@@ -369,6 +388,18 @@ function RunsTab({ projectId }: { projectId: string }) {
   const [triggering, setTriggering] = useState<Record<string, 'running' | 'done'>>({});
   const [agentFilter, setAgentFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
+  const [latestByAgent, setLatestByAgent] = useState<Record<string, AgentRun>>({});
+  const [agentsByType, setAgentsByType] = useState<Record<string, ProjectAgent>>({});
+
+  useEffect(() => {
+    apiFetch<{ data: ProjectAgent[] }>(`/api/v1/projects/${projectId}/agents`)
+      .then((r) => {
+        const byType: Record<string, ProjectAgent> = {};
+        for (const a of r.data) byType[a.agent_type] = a;
+        setAgentsByType(byType);
+      })
+      .catch(() => {});
+  }, [projectId]);
 
   const load = useCallback(async (p: number, agent: string, status: string) => {
     setLoading(true);
@@ -382,6 +413,14 @@ function RunsTab({ projectId }: { projectId: string }) {
       setRuns(res.data);
       setTotal(res.pagination.total);
       setPage(p);
+      // Sync latest-by-agent from the unfiltered first page if no filters active
+      if (!agent && !status && p === 1) {
+        const byAgent: Record<string, AgentRun> = {};
+        for (const run of res.data) {
+          if (!byAgent[run.agent_type]) byAgent[run.agent_type] = run;
+        }
+        setLatestByAgent(byAgent);
+      }
     } finally {
       setLoading(false);
     }
@@ -422,13 +461,54 @@ function RunsTab({ projectId }: { projectId: string }) {
           {AGENT_TYPES.map((t) => {
             const info = AGENT_DESCRIPTIONS[t];
             const state = triggering[t];
+            const latest = latestByAgent[t];
+            const agent = agentsByType[t];
+            const isEnabled = agent?.enabled ?? true;
             return (
               <div key={t} className="px-4 py-3 flex flex-col gap-2">
-                <div className="flex items-center gap-1.5">
-                  <span className="text-base leading-none">{info.icon}</span>
-                  <span className={`text-xs font-semibold px-1.5 py-0.5 rounded capitalize ${AGENT_COLORS[t] ?? 'bg-gray-100 text-gray-600'}`}>{info.label}</span>
+                <div className="flex items-center justify-between gap-1.5">
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-base leading-none">{info.icon}</span>
+                    <span className={`text-xs font-semibold px-1.5 py-0.5 rounded capitalize ${AGENT_COLORS[t] ?? 'bg-gray-100 text-gray-600'}`}>{info.label}</span>
+                  </div>
+                  <span className={`text-xs px-1.5 py-0.5 rounded-full font-medium ${isEnabled ? 'bg-green-50 text-green-600' : 'bg-gray-100 text-gray-400'}`}>
+                    {isEnabled ? '运行中' : '已停用'}
+                  </span>
                 </div>
                 <p className="text-xs text-gray-500 leading-relaxed">{info.desc}</p>
+
+                {/* Latest run status */}
+                {latest ? (
+                  <div className={`flex items-start gap-1.5 text-xs rounded-md px-2 py-1.5 ${
+                    latest.status === 'running'  ? 'bg-blue-50 text-blue-700' :
+                    latest.status === 'success'  ? 'bg-green-50 text-green-700' :
+                    latest.status === 'failed'   ? 'bg-red-50 text-red-600' :
+                    latest.status === 'skipped'  ? 'bg-amber-50 text-amber-700' :
+                                                   'bg-gray-50 text-gray-500'
+                  }`}>
+                    <span className="flex-shrink-0 mt-0.5">
+                      {latest.status === 'running' ? (
+                        <span className="w-2 h-2 rounded-full bg-blue-400 animate-pulse inline-block" />
+                      ) : latest.status === 'success' ? (
+                        <svg className="w-3 h-3" viewBox="0 0 16 16" fill="currentColor"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z"/></svg>
+                      ) : latest.status === 'failed' ? (
+                        <svg className="w-3 h-3" viewBox="0 0 16 16" fill="currentColor"><path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.75.75 0 1 1 1.06 1.06L9.06 8l3.22 3.22a.75.75 0 1 1-1.06 1.06L8 9.06l-3.22 3.22a.75.75 0 0 1-1.06-1.06L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06Z"/></svg>
+                      ) : (
+                        <span className="w-2 h-2 rounded-full bg-current inline-block opacity-60" />
+                      )}
+                    </span>
+                    <span className="min-w-0">
+                      <span className="font-medium">{runStatusLabel(latest.status)}</span>
+                      <span className="opacity-70"> · {fmtTimeAgo(latest.started_at)}</span>
+                      {latest.summary && (
+                        <span className="block opacity-70 truncate" title={latest.summary}>{latest.summary}</span>
+                      )}
+                    </span>
+                  </div>
+                ) : (
+                  <div className="text-xs text-gray-300 px-2 py-1.5">暂无运行记录</div>
+                )}
+
                 <button
                   onClick={() => triggerRun(t)}
                   disabled={!!state}

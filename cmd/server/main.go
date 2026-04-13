@@ -11,15 +11,15 @@ import (
 
 	"github.com/getsentry/sentry-go"
 
-	api "github.com/fixloop/fixloop/internal/api"
 	"github.com/fixloop/fixloop/internal/agentrun"
-	"github.com/fixloop/fixloop/internal/config"
-	"github.com/fixloop/fixloop/internal/db"
 	"github.com/fixloop/fixloop/internal/agents/explore"
 	"github.com/fixloop/fixloop/internal/agents/fix"
 	"github.com/fixloop/fixloop/internal/agents/generic"
 	"github.com/fixloop/fixloop/internal/agents/master"
 	"github.com/fixloop/fixloop/internal/agents/plan"
+	api "github.com/fixloop/fixloop/internal/api"
+	"github.com/fixloop/fixloop/internal/config"
+	"github.com/fixloop/fixloop/internal/db"
 	"github.com/fixloop/fixloop/internal/scheduler"
 	"github.com/fixloop/fixloop/internal/storage"
 	"github.com/fixloop/fixloop/internal/tgbot"
@@ -128,7 +128,7 @@ func main() {
 	}
 
 	// Register all active projects before starting
-	if err := sched.LoadActiveProjects(database); err != nil {
+	if err := sched.LoadActiveProjects(); err != nil {
 		slog.Warn("failed to load active projects into scheduler", "err", err)
 	}
 	sched.Start()

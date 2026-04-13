@@ -49,7 +49,8 @@
       "Bash(sed -n '131,175p' internal/api/handlers/auth.go)",
       "Bash(sed -n '420,445p' /home/ubuntu/fy/work/fixloop/internal/api/handlers/projects.go)",
       "Bash(sed -n '575,600p' /home/ubuntu/fy/work/fixloop/internal/api/handlers/projects.go)",
-      "Bash(git log:*)"
+      "Bash(git log:*)",
+      "Bash(npx @google/gemini-cli --help)"
     ]
   }
 }

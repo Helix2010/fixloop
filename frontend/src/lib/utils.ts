@@ -33,10 +33,23 @@ const issueStatusLabels: Record<string, string> = {
 };
 export const issueStatusLabel = (s: string) => issueStatusLabels[s] ?? s;
 
+export const issueStatusColor: Record<string, string> = {
+  open:          'bg-green-100 text-green-700',
+  fixing:        'bg-blue-100 text-blue-700',
+  'needs-human': 'bg-red-100 text-red-700',
+  closed:        'bg-gray-100 text-gray-500',
+};
+
 const prStatusLabels: Record<string, string> = {
   open: '开放', merged: '已合并', closed: '已关闭',
 };
 export const prStatusLabel = (s: string) => prStatusLabels[s] ?? s;
+
+export const prStatusColor: Record<string, string> = {
+  open:   'bg-green-100 text-green-700',
+  merged: 'bg-purple-100 text-purple-700',
+  closed: 'bg-gray-100 text-gray-600',
+};
 
 const runStatusLabels: Record<string, string> = {
   running: '运行中', success: '成功', failed: '失败', skipped: '跳过', abandoned: '已放弃',

@@ -18,6 +18,7 @@ func NewRouter(db *sql.DB, cfg *config.Config, sched handlers.ProjectScheduler, 
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.Use(requestLogger())
+	r.Use(middleware.SecureHeaders())
 	r.Use(middleware.PerUserRateLimit(rate.Limit(20), 50))
 
 	healthH := &handlers.HealthHandler{DB: db}
@@ -46,12 +47,16 @@ func NewRouter(db *sql.DB, cfg *config.Config, sched handlers.ProjectScheduler, 
 		authed.DELETE("/me", authH.DeleteMe)
 		authed.POST("/me/tg-bind", authH.TGBind)
 
-		authed.GET("/admin/tg-config", adminH.GetTGConfig)
-		authed.PATCH("/admin/tg-config", adminH.PatchTGConfig)
-		authed.POST("/admin/tg-config/verify", adminH.VerifyTGToken)
-		authed.GET("/admin/tg-chats", adminH.GetTGChats)
-		authed.GET("/admin/workspace", adminH.GetWorkspace)
-		authed.POST("/admin/workspace/init", adminH.InitWorkspace)
+		admin := authed.Group("/admin")
+		admin.Use(middleware.AdminOnly())
+		{
+			admin.GET("/tg-config", adminH.GetTGConfig)
+			admin.PATCH("/tg-config", adminH.PatchTGConfig)
+			admin.POST("/tg-config/verify", adminH.VerifyTGToken)
+			admin.GET("/tg-chats", adminH.GetTGChats)
+			admin.GET("/workspace", adminH.GetWorkspace)
+			admin.POST("/workspace/init", adminH.InitWorkspace)
+		}
 
 		authed.POST("/projects", projectH.Create)
 		authed.GET("/projects", projectH.List)

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/fixloop/fixloop/internal/agentrun"
+	"github.com/fixloop/fixloop/internal/agents/shared"
 	"github.com/fixloop/fixloop/internal/config"
 	"github.com/fixloop/fixloop/internal/crypto"
 	githubclient "github.com/fixloop/fixloop/internal/github"
@@ -68,12 +69,16 @@ type prRow struct {
 func (a *Agent) Run(ctx context.Context, projectID int64, projectAgentID int64) {
 	// Load from project_agents
 	var masterEnabled bool
+	var dailyLimit int
 	dbErr := a.DB.QueryRowContext(ctx,
-		`SELECT enabled FROM project_agents WHERE id = ?`, projectAgentID,
-	).Scan(&masterEnabled)
+		`SELECT enabled, daily_limit FROM project_agents WHERE id = ?`, projectAgentID,
+	).Scan(&masterEnabled, &dailyLimit)
 	if dbErr == nil && !masterEnabled {
 		slog.Info("master: agent disabled in project_agents, skipping", "project_id", projectID)
 		return
+	}
+	if dailyLimit <= 0 {
+		dailyLimit = 20
 	}
 
 	var (
@@ -96,6 +101,11 @@ func (a *Agent) Run(ctx context.Context, projectID int64, projectAgentID int64) 
 	var pcfg projectConf
 	if err := json.Unmarshal([]byte(cfgJSON), &pcfg); err != nil {
 		slog.Error("master: parse config", "project_id", projectID, "err", err)
+		return
+	}
+
+	if shared.ExceedsDailyLimit(ctx, a.DB, projectID, "master", dailyLimit) {
+		slog.Info("master: daily run limit reached", "project_id", projectID)
 		return
 	}
 
@@ -127,24 +137,24 @@ func (a *Agent) runMaster(ctx context.Context, projectID, userID, runID int64, p
 	// Step 2: Find oldest open PR
 	pr, err := a.findOldestOpenPR(ctx, projectID)
 	if err != nil {
-		logf("find open PR: %v", err)
+		logf("查找待处理 PR 失败：%v", err)
 		return logBuf.String(), "failed"
 	}
 	if pr == nil {
-		logf("no open PRs, nothing to do")
+		logf("暂无待处理 PR")
 		return logBuf.String(), "skipped"
 	}
-	logf("processing PR #%d (branch %s)", pr.githubNumber, pr.branch)
+	logf("处理 PR #%d（分支：%s）", pr.githubNumber, pr.branch)
 
 	// Decrypt PAT
 	patEnc, err := hex.DecodeString(pcfg.GitHub.PAT)
 	if err != nil {
-		logf("ERROR: decode PAT hex: %v", err)
+		logf("错误：PAT 解码失败：%v", err)
 		return logBuf.String(), "failed"
 	}
 	pat, err := crypto.Decrypt(map[byte][]byte{a.Cfg.AESKeyID: a.Cfg.AESKey}, patEnc)
 	if err != nil {
-		logf("ERROR: decrypt PAT: %v", err)
+		logf("错误：PAT 解密失败：%v", err)
 		return logBuf.String(), "failed"
 	}
 	gh := githubclient.New(string(pat))
@@ -152,7 +162,7 @@ func (a *Agent) runMaster(ctx context.Context, projectID, userID, runID int64, p
 	// Step 3: Check reviews
 	reviews, err := gh.ListPRReviews(ctx, pcfg.GitHub.Owner, pcfg.GitHub.Repo, pr.githubNumber)
 	if err != nil {
-		logf("WARN: list PR reviews: %v", err)
+		logf("警告：获取 PR review 失败：%v", err)
 	}
 
 	mergeable := false
@@ -169,14 +179,14 @@ func (a *Agent) runMaster(ctx context.Context, projectID, userID, runID int64, p
 
 	// 24h review timeout check
 	if !mergeable && time.Since(pr.createdAt) > 24*time.Hour {
-		logf("PR #%d awaiting review > 24h, notifying", pr.githubNumber)
+		logf("PR #%d 等待 review 超过 24 小时，已发送通知", pr.githubNumber)
 		_ = notify.Send(ctx, a.DB, userID, projectID, "review_timeout",
 			fmt.Sprintf("🔔 PR #%d 等待 review 超过 24h，请检查", pr.githubNumber),
 		)
 		return logBuf.String(), "skipped"
 	}
 	if !mergeable {
-		logf("PR #%d not yet mergeable, waiting", pr.githubNumber)
+		logf("PR #%d 尚不可合并，等待中", pr.githubNumber)
 		return logBuf.String(), "skipped"
 	}
 
@@ -184,14 +194,14 @@ func (a *Agent) runMaster(ctx context.Context, projectID, userID, runID int64, p
 	mergeTitle := fmt.Sprintf("fix: squash merge PR #%d", pr.githubNumber)
 	mergeSHA, err := gh.MergePR(ctx, pcfg.GitHub.Owner, pcfg.GitHub.Repo, pr.githubNumber, mergeTitle)
 	if err != nil {
-		logf("ERROR: merge PR #%d: %v", pr.githubNumber, err)
+		logf("错误：合并 PR #%d 失败：%v", pr.githubNumber, err)
 		return logBuf.String(), "failed"
 	}
 	shortSHA := mergeSHA
 	if len(shortSHA) > 8 {
 		shortSHA = shortSHA[:8]
 	}
-	logf("merged PR #%d, SHA=%s", pr.githubNumber, shortSHA)
+	logf("已合并 PR #%d（SHA=%s）", pr.githubNumber, shortSHA)
 
 	// Update prs.status = merged
 	_, _ = a.DB.ExecContext(ctx,
@@ -203,16 +213,16 @@ func (a *Agent) runMaster(ctx context.Context, projectID, userID, runID int64, p
 
 	// Step 5: Wait for Vercel deployment (if configured)
 	if pcfg.Vercel.ProjectID != "" && pcfg.Vercel.Token != "" {
-		logf("waiting for Vercel deployment (SHA=%s)...", shortSHA)
+		logf("等待 Vercel 部署（SHA=%s）…", shortSHA)
 		vercelTokenEnc, _ := hex.DecodeString(pcfg.Vercel.Token)
 		vercelToken, err := crypto.Decrypt(map[byte][]byte{a.Cfg.AESKeyID: a.Cfg.AESKey}, vercelTokenEnc)
 		if err != nil {
-			logf("ERROR: decrypt vercel token: %v", err)
+			logf("错误：Vercel Token 解密失败：%v", err)
 			return logBuf.String(), "failed"
 		}
 		dep, err := vercel.WaitForDeployment(ctx, string(vercelToken), pcfg.Vercel.ProjectID, mergeSHA)
 		if err != nil {
-			logf("ERROR: vercel deploy: %v", err)
+			logf("错误：Vercel 部署失败：%v", err)
 			_ = notify.Send(ctx, a.DB, userID, projectID, "deploy_failed",
 				fmt.Sprintf("🔥 PR #%d Vercel 部署失败/超时: %v", pr.githubNumber, err),
 			)
@@ -222,30 +232,30 @@ func (a *Agent) runMaster(ctx context.Context, projectID, userID, runID int64, p
 			return logBuf.String(), "failed"
 		}
 		if dep != nil {
-			logf("Vercel deployment READY: %s", dep.UID)
+			logf("Vercel 部署就绪：%s", dep.UID)
 		}
 	}
 
 	// Step 6: Playwright acceptance test
 	if pcfg.Test.StagingURL == "" {
-		logf("no staging_url, closing issue without acceptance test")
+		logf("未配置测试地址，跳过验收测试直接关闭 Issue")
 		if pr.issueID.Valid {
 			a.closeIssueSuccess(ctx, projectID, userID, pr, pcfg, gh)
 		}
 		if err := gh.DeleteBranch(ctx, pcfg.GitHub.Owner, pcfg.GitHub.Repo, pr.branch); err != nil {
-			logf("WARN: delete branch %s: %v", pr.branch, err)
+			logf("警告：删除分支 %s 失败：%v", pr.branch, err)
 		}
 		return logBuf.String(), "success"
 	}
 
-	if err := ssrf.ValidateHostname(extractHostname(pcfg.Test.StagingURL)); err != nil {
-		logf("WARN: staging_url SSRF check failed: %v", err)
+	if err := ssrf.ValidateHostname(ssrf.ExtractHostname(pcfg.Test.StagingURL)); err != nil {
+		logf("警告：测试地址安全检查失败：%v", err)
 		return logBuf.String(), "failed"
 	}
 
 	locked, err := playwright.AcquireLock(a.DB, projectID)
 	if err != nil || !locked {
-		logf("WARN: playwright lock busy, skipping acceptance test this run")
+		logf("警告：Playwright 锁被占用，跳过本次验收测试")
 		return logBuf.String(), "skipped"
 	}
 	defer playwright.ReleaseLock(a.DB, projectID) //nolint:errcheck
@@ -258,7 +268,7 @@ func (a *Agent) runMaster(ctx context.Context, projectID, userID, runID int64, p
 	if pcfg.Test.StagingAuth != "" {
 		authEnc, _ := hex.DecodeString(pcfg.Test.StagingAuth)
 		authJSON, _ := crypto.Decrypt(map[byte][]byte{a.Cfg.AESKeyID: a.Cfg.AESKey}, authEnc)
-		authCfg = parseAuthConfig(authJSON)
+		authCfg = shared.ParseAuthConfig(authJSON)
 	}
 
 	exec := &playwright.Executor{
@@ -276,29 +286,29 @@ func (a *Agent) runMaster(ctx context.Context, projectID, userID, runID int64, p
 		if err != nil {
 			passed = false
 			failMsg = fmt.Sprintf("seed check %d error: %v", i, err)
-			logf("acceptance seed check %d ERROR: %v", i, err)
+			logf("验收预检 %d 错误：%v", i, err)
 			break
 		}
 		if result != nil && !result.Passed {
 			passed = false
 			failMsg = result.ErrorMsg
-			logf("acceptance seed check %d FAILED: %s", i, failMsg)
+			logf("验收预检 %d 失败：%s", i, failMsg)
 			break
 		}
 	}
 
 	if passed {
-		logf("acceptance test PASSED")
+		logf("验收测试通过 ✓")
 		if pr.issueID.Valid {
 			a.closeIssueSuccess(ctx, projectID, userID, pr, pcfg, gh)
 		}
 		if err := gh.DeleteBranch(ctx, pcfg.GitHub.Owner, pcfg.GitHub.Repo, pr.branch); err != nil {
-			logf("WARN: delete branch %s: %v", pr.branch, err)
+			logf("警告：删除分支 %s 失败：%v", pr.branch, err)
 		}
 		return logBuf.String(), "success"
 	}
 
-	logf("acceptance test FAILED: %s", failMsg)
+	logf("验收测试失败：%s", failMsg)
 	if pr.issueID.Valid {
 		a.acceptanceFailure(ctx, projectID, userID, pr, failMsg)
 	}
@@ -444,29 +454,4 @@ func (a *Agent) reopenIssue(ctx context.Context, issueID, prID int64) {
 		issueID,
 	)
 	_, _ = a.DB.ExecContext(ctx, `UPDATE prs SET status = 'closed' WHERE id = ?`, prID)
-}
-
-func parseAuthConfig(raw []byte) *playwright.AuthConfig {
-	var m map[string]string
-	if err := json.Unmarshal(raw, &m); err != nil {
-		return nil
-	}
-	return &playwright.AuthConfig{
-		Type:     m["type"],
-		Username: m["username"],
-		Password: m["password"],
-		Name:     m["name"],
-		Value:    m["value"],
-	}
-}
-
-func extractHostname(rawURL string) string {
-	s := rawURL
-	if i := strings.Index(s, "://"); i >= 0 {
-		s = s[i+3:]
-	}
-	if i := strings.IndexAny(s, "/:"); i >= 0 {
-		s = s[:i]
-	}
-	return s
 }

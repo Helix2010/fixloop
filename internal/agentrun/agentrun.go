@@ -30,9 +30,17 @@ func Start(ctx context.Context, db *sql.DB, projectID int64, agentType string, c
 
 // extractSummary returns the last meaningful line of the output, capped at 200 runes.
 func extractSummary(output string) string {
-	lines := strings.Split(strings.TrimSpace(output), "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(lines[i])
+	s := strings.TrimSpace(output)
+	for s != "" {
+		i := strings.LastIndexByte(s, '\n')
+		var line string
+		if i < 0 {
+			line = strings.TrimSpace(s)
+			s = ""
+		} else {
+			line = strings.TrimSpace(s[i+1:])
+			s = s[:i]
+		}
 		if line == "" {
 			continue
 		}

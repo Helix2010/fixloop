@@ -4,7 +4,6 @@ package tgbot
 import (
 	"bytes"
 	"context"
-	"crypto/sha1"
 	"database/sql"
 	_ "embed"
 	"encoding/hex"
@@ -28,6 +27,7 @@ import (
 	"github.com/fixloop/fixloop/internal/gitops"
 	"github.com/fixloop/fixloop/internal/runner"
 	"github.com/fixloop/fixloop/internal/storage"
+	"github.com/fixloop/fixloop/internal/util"
 )
 
 //go:embed prompts/issue_analysis.txt
@@ -282,7 +282,7 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 		}
 		b.cmdSetStatus(ctx, chatID, senderID, proj, "active")
 	default:
-		b.send(chatID, "未知命令。支持: /status /issues /issue /fix /explore /run /pause /resume")
+		b.send(chatID, "未知命令。支持: /status /issues /issue /fix /explore /run <alias> /pause /resume")
 	}
 }
 
@@ -291,9 +291,15 @@ func (b *Bot) cmdStart(ctx context.Context, chatID int64, token string) {
 		b.send(chatID, "欢迎使用 FixLoop Bot！请在 Dashboard 获取绑定链接。")
 		return
 	}
-	key := "tg_bind_" + token
+	// Hash the token before lookup — tokens are stored as SHA-256(raw bytes).
+	raw, err := hex.DecodeString(token)
+	if err != nil || len(raw) != 16 {
+		b.send(chatID, "❌ 绑定 token 格式无效，请重新从 Dashboard 获取。")
+		return
+	}
+	key := util.TGBindKey(raw)
 	var userIDStr string
-	err := b.db.QueryRowContext(ctx,
+	err = b.db.QueryRowContext(ctx,
 		`SELECT value FROM system_config WHERE key_name = ? AND updated_at > NOW() - INTERVAL 10 MINUTE`,
 		key,
 	).Scan(&userIDStr)
@@ -416,15 +422,10 @@ func (b *Bot) cmdRun(ctx context.Context, chatID, senderID int64, args string) {
 	}
 	parts := strings.Fields(args)
 	if len(parts) < 2 {
-		b.send(chatID, "用法: /run <agent> <项目名>\nagent: fix | explore | plan | master\n\n快捷方式: /fix <项目名>  /explore <项目名>")
+		b.send(chatID, "用法: /run <agent别名> <项目名>\n\n快捷方式: /fix <项目名>  /explore <项目名>")
 		return
 	}
 	agentAlias, projectName := parts[0], parts[1]
-	allowed := map[string]bool{"fix": true, "explore": true, "plan": true, "master": true}
-	if !allowed[agentAlias] {
-		b.send(chatID, "agent 必须是 fix/explore/plan/master")
-		return
-	}
 	b.triggerAgent(ctx, chatID, userID, projectName, agentAlias)
 }
 
@@ -679,7 +680,7 @@ func (b *Bot) cmdSubmitIssue(ctx context.Context, chatID, senderChatID int64, ar
 	if len(issueTitle) > 120 {
 		issueTitle = issueTitle[:120]
 	}
-	titleHash := fmt.Sprintf("%x", sha1.Sum([]byte(issueTitle)))
+	titleHash := util.TitleHash(issueTitle)
 
 	// Duplicate detection: check if an issue with the same title already exists.
 	var existingID int64

@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"context"
-	"crypto/sha1"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -10,9 +9,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/gin-gonic/gin"
 	mysql "github.com/go-sql-driver/mysql"
@@ -23,6 +22,7 @@ import (
 	"github.com/fixloop/fixloop/internal/crypto"
 	githubclient "github.com/fixloop/fixloop/internal/github"
 	"github.com/fixloop/fixloop/internal/ssrf"
+	"github.com/fixloop/fixloop/internal/util"
 )
 
 // ProjectScheduler is the scheduler interface needed by the project handler.
@@ -75,22 +75,23 @@ type storedS3 struct {
 }
 
 type projectConfig struct {
-	GitHub          storedGitHub       `json:"github"`
-	IssueTracker    storedIssueTracker `json:"issue_tracker"`
-	SSHPrivateKey   string             `json:"ssh_private_key"` // hex(AES-GCM encrypted)
-	DeployKeyID     int64              `json:"deploy_key_id,omitempty"`
-	Vercel          storedVercel       `json:"vercel,omitempty"`
-	Test            storedTest         `json:"test,omitempty"`
-	S3              storedS3           `json:"s3,omitempty"`
-	AIRunner        string             `json:"ai_runner,omitempty"`
-	AIModel         string             `json:"ai_model,omitempty"`
-	AIAPIBase       string             `json:"ai_api_base,omitempty"`
-	AIAPIKey        string             `json:"ai_api_key,omitempty"`    // hex(AES-GCM encrypted)
-	NotifyEvents    []string           `json:"notify_events,omitempty"` // nil/empty = all enabled
-	TGChatID        *int64             `json:"tg_chat_id,omitempty"`
-	WebhookToken    string             `json:"webhook_token,omitempty"`  // legacy single token; migrated on first write
-	WebhookTokens   []string           `json:"webhook_tokens,omitempty"` // multi-token list
-	PromptOverrides struct {
+	GitHub             storedGitHub       `json:"github"`
+	IssueTracker       storedIssueTracker `json:"issue_tracker"`
+	SSHPrivateKey      string             `json:"ssh_private_key"` // hex(AES-GCM encrypted)
+	DeployKeyID        int64              `json:"deploy_key_id,omitempty"`
+	DeployKeyConfirmed bool               `json:"deploy_key_confirmed,omitempty"`
+	Vercel             storedVercel       `json:"vercel,omitempty"`
+	Test               storedTest         `json:"test,omitempty"`
+	S3                 storedS3           `json:"s3,omitempty"`
+	AIRunner           string             `json:"ai_runner,omitempty"`
+	AIModel            string             `json:"ai_model,omitempty"`
+	AIAPIBase          string             `json:"ai_api_base,omitempty"`
+	AIAPIKey           string             `json:"ai_api_key,omitempty"`    // hex(AES-GCM encrypted)
+	NotifyEvents       []string           `json:"notify_events,omitempty"` // nil/empty = all enabled
+	TGChatID           *int64             `json:"tg_chat_id,omitempty"`
+	WebhookToken       string             `json:"webhook_token,omitempty"`  // legacy single token; migrated on first write
+	WebhookTokens      []string           `json:"webhook_tokens,omitempty"` // multi-token list
+	PromptOverrides    struct {
 		IssueAnalysis string `json:"issue_analysis,omitempty"`
 	} `json:"prompt_overrides,omitempty"`
 }
@@ -234,6 +235,16 @@ func (h *ProjectHandler) Create(c *gin.Context) {
 		return
 	}
 
+	// Validate GitHub owner/repo slugs to prevent path-traversal and unexpected input.
+	if err := validateGitHubSlug("github.owner", req.GitHub.Owner); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	if err := validateGitHubSlug("github.repo", req.GitHub.Repo); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
 	// SSRF: validate staging URL before doing any crypto/DB work
 	if req.Test.StagingURL != "" {
 		if err := ssrf.ValidateURL(req.Test.StagingURL); err != nil {
@@ -356,8 +367,9 @@ func (h *ProjectHandler) Create(c *gin.Context) {
 		_, _ = h.DB.ExecContext(ctx,
 			`UPDATE projects SET status = 'error' WHERE id = ?`, projectID,
 		)
+		slog.Warn("create project: deploy key registration failed", "project_id", projectID, "err", err)
 		response.Err(c, http.StatusUnprocessableEntity, "DEPLOY_KEY_FAILED",
-			fmt.Sprintf("项目已创建但 Deploy Key 注册失败: %v — 请检查 PAT 是否有 Administration 权限", err))
+			"项目已创建但 Deploy Key 注册失败 — 请检查 PAT 是否有 Administration 权限")
 		return
 	}
 
@@ -703,9 +715,9 @@ func (h *ProjectHandler) seedBacklog(ctx context.Context, projectID int64) error
 		 (?, ?, ?, ?, 'ui', 1, 'seed'),
 		 (?, ?, ?, ?, 'ui', 1, 'seed'),
 		 (?, ?, ?, ?, 'ui', 1, 'seed')`,
-		projectID, s0, titleHash(s0), "验证首页返回 HTTP 200 且无 JavaScript 崩溃",
-		projectID, s1, titleHash(s1), "验证页面加载过程中无 console.error 输出",
-		projectID, s2, titleHash(s2), "验证 body 非空且页面无服务器错误",
+		projectID, s0, util.TitleHash(s0), "验证首页返回 HTTP 200 且无 JavaScript 崩溃",
+		projectID, s1, util.TitleHash(s1), "验证页面加载过程中无 console.error 输出",
+		projectID, s2, util.TitleHash(s2), "验证 body 非空且页面无服务器错误",
 	)
 	if err != nil {
 		return fmt.Errorf("seed backlog: %w", err)
@@ -779,23 +791,24 @@ func validateName(name string) (string, error) {
 	return name, nil
 }
 
+// githubSlugRe allows GitHub owner/repo names: letters, digits, hyphens, underscores, dots.
+// Max 100 chars (GitHub's own limit). No leading/trailing hyphens.
+var githubSlugRe = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9._-]{0,98}[a-zA-Z0-9])?$|^[a-zA-Z0-9]$`)
+
+func validateGitHubSlug(field, value string) error {
+	if value == "" {
+		return fmt.Errorf("%s is required", field)
+	}
+	if !githubSlugRe.MatchString(value) {
+		return fmt.Errorf("%s contains invalid characters (only letters, digits, hyphens, underscores, dots allowed)", field)
+	}
+	return nil
+}
+
 // isDuplicateEntry detects MySQL duplicate-key errors (error 1062).
 func isDuplicateEntry(err error) bool {
 	var me *mysql.MySQLError
 	return errors.As(err, &me) && me.Number == 1062
-}
-
-// titleHash returns the SHA-1 hex of the normalized title (lowercase, no punctuation/spaces).
-// Used to deduplicate backlog scenarios by content rather than exact text.
-func titleHash(title string) string {
-	var b strings.Builder
-	for _, r := range strings.ToLower(title) {
-		if !unicode.IsPunct(r) && !unicode.IsSpace(r) {
-			b.WriteRune(r)
-		}
-	}
-	sum := sha1.Sum([]byte(b.String()))
-	return hex.EncodeToString(sum[:])
 }
 
 func orDefault(s, def string) string {
@@ -831,37 +844,23 @@ func (h *ProjectHandler) ConfirmDeployKey(c *gin.Context) {
 // GET /api/v1/projects/:project_id/deploy-key
 func (h *ProjectHandler) GetDeployKey(c *gin.Context) {
 	projectID := c.GetInt64("project_id")
-	ctx := c.Request.Context()
 
-	var cfgJSON string
-	if err := h.DB.QueryRowContext(ctx, `SELECT config FROM projects WHERE id = ?`, projectID).Scan(&cfgJSON); err != nil {
-		response.Internal(c)
+	_, cfg, err := h.fetchProject(c, projectID)
+	if err != nil {
 		return
-	}
-	var cfg projectConfig
-	if err := json.Unmarshal([]byte(cfgJSON), &cfg); err != nil {
-		response.Internal(c)
-		return
-	}
-
-	// Also check deploy_key_confirmed flag (set when user manually adds the key)
-	var rawMap map[string]json.RawMessage
-	_ = json.Unmarshal([]byte(cfgJSON), &rawMap)
-	var deployKeyConfirmed bool
-	if v, ok := rawMap["deploy_key_confirmed"]; ok {
-		_ = json.Unmarshal(v, &deployKeyConfirmed)
 	}
 
 	pubKey, err := deriveSSHPublicKey(h.Cfg, cfg.SSHPrivateKey)
 	if err != nil {
-		response.Err(c, http.StatusUnprocessableEntity, "KEY_ERROR", "无法解析 SSH 密钥: "+err.Error())
+		slog.Warn("get deploy key: SSH key parse failed", "project_id", c.GetInt64("project_id"), "err", err)
+		response.Err(c, http.StatusUnprocessableEntity, "KEY_ERROR", "无法解析 SSH 密钥，请重新生成")
 		return
 	}
 
 	response.OK(c, gin.H{
 		"public_key":    pubKey,
 		"deploy_key_id": cfg.DeployKeyID,
-		"registered":    cfg.DeployKeyID != 0 || deployKeyConfirmed,
+		"registered":    cfg.DeployKeyID != 0 || cfg.DeployKeyConfirmed,
 	})
 }
 
@@ -884,7 +883,8 @@ func (h *ProjectHandler) RegisterDeployKey(c *gin.Context) {
 
 	pubKey, err := deriveSSHPublicKey(h.Cfg, cfg.SSHPrivateKey)
 	if err != nil {
-		response.Err(c, http.StatusUnprocessableEntity, "KEY_ERROR", "无法解析 SSH 密钥: "+err.Error())
+		slog.Warn("register deploy key: SSH key parse failed", "project_id", c.GetInt64("project_id"), "err", err)
+		response.Err(c, http.StatusUnprocessableEntity, "KEY_ERROR", "无法解析 SSH 密钥，请重新生成")
 		return
 	}
 
@@ -909,8 +909,9 @@ func (h *ProjectHandler) RegisterDeployKey(c *gin.Context) {
 	keyTitle := fmt.Sprintf("fixloop-project-%d", projectID)
 	dk, err := gh.AddDeployKey(ctx, cfg.GitHub.Owner, cfg.GitHub.Repo, keyTitle, strings.TrimSpace(pubKey))
 	if err != nil {
+		slog.Warn("register deploy key: failed", "project_id", projectID, "err", err)
 		response.Err(c, http.StatusUnprocessableEntity, "DEPLOY_KEY_FAILED",
-			fmt.Sprintf("注册 Deploy Key 失败: %v — 请确认 PAT 有 Administration 权限", err))
+			"注册 Deploy Key 失败 — 请确认 PAT 有 Administration 权限")
 		return
 	}
 

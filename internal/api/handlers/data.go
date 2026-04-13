@@ -17,6 +17,11 @@ type DataHandler struct {
 	Scheduler ProjectScheduler
 }
 
+var (
+	validAgentTypes = map[string]bool{"explore": true, "fix": true, "master": true, "plan": true, "generic": true}
+	validStatuses   = map[string]bool{"running": true, "success": true, "failed": true, "skipped": true, "abandoned": true}
+)
+
 // ---- Issues ----
 
 type issueResp struct {
@@ -253,6 +258,14 @@ func (h *DataHandler) ListRuns(c *gin.Context) {
 	page, perPage := parsePagination(c)
 	agentTypeFilter := c.Query("agent_type") // optional: explore|fix|master|plan|generic
 	statusFilter := c.Query("status")        // optional: running|success|failed|skipped|abandoned
+
+	// Validate against known enum values to prevent unexpected filtering.
+	if agentTypeFilter != "" && !validAgentTypes[agentTypeFilter] {
+		agentTypeFilter = ""
+	}
+	if statusFilter != "" && !validStatuses[statusFilter] {
+		statusFilter = ""
+	}
 
 	// Build dynamic WHERE clause
 	where := "project_id = ?"

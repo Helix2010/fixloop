@@ -13,11 +13,11 @@ import (
 	"time"
 
 	"github.com/fixloop/fixloop/internal/agentrun"
+	"github.com/fixloop/fixloop/internal/agents/shared"
 	"github.com/fixloop/fixloop/internal/config"
 	"github.com/fixloop/fixloop/internal/crypto"
 	githubclient "github.com/fixloop/fixloop/internal/github"
 	"github.com/fixloop/fixloop/internal/playwright"
-	"github.com/fixloop/fixloop/internal/scheduler"
 	"github.com/fixloop/fixloop/internal/ssrf"
 	"github.com/fixloop/fixloop/internal/storage"
 )
@@ -113,7 +113,7 @@ func (a *Agent) Run(ctx context.Context, projectID int64, projectAgentID int64) 
 	}
 
 	// SSRF re-check (防 DNS rebinding)
-	if err := ssrf.ValidateHostname(hostname(pcfg.Test.StagingURL)); err != nil {
+	if err := ssrf.ValidateHostname(ssrf.ExtractHostname(pcfg.Test.StagingURL)); err != nil {
 		slog.Warn("explore: staging_url SSRF check failed", "project_id", projectID, "err", err)
 		return
 	}
@@ -128,12 +128,9 @@ func (a *Agent) Run(ctx context.Context, projectID int64, projectAgentID int64) 
 	var output strings.Builder
 	finalStatus := "success"
 
-	defer func() {
-		_ = agentrun.Finish(ctx, a.DB, runID, finalStatus, output.String())
-	}()
-
 	agentrun.WithRecover(runID, a.DB, func() {
 		a.runLoop(ctx, projectID, userID, runID, configVersion, pcfg, priorityRules, dailyLimit, &output, &finalStatus)
+		_ = agentrun.Finish(ctx, a.DB, runID, finalStatus, output.String())
 	})
 }
 
@@ -157,33 +154,23 @@ func (a *Agent) runLoop(
 	db := a.DB
 	got, err := playwright.AcquireLock(db, projectID)
 	if err != nil || !got {
-		logf("explore: could not acquire playwright lock, skipping")
+		logf("探索：Playwright 锁被占用，跳过本次运行")
 		*finalStatus = "skipped"
 		return
 	}
 	defer playwright.ReleaseLock(db, projectID)
 
 	// Daily run limit check — skipped for manually forced runs
-	forced, _ := ctx.Value(scheduler.ForcedRunKey).(bool)
-	if !forced {
-		var dailyCount int
-		_ = db.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM agent_runs
-			 WHERE project_id = ? AND agent_type = 'explore'
-			   AND started_at > NOW() - INTERVAL 24 HOUR`,
-			projectID,
-		).Scan(&dailyCount)
-		if dailyCount > dailyLimit {
-			logf("explore: daily run limit reached (%d/%d)", dailyCount, dailyLimit)
-			*finalStatus = "skipped"
-			return
-		}
+	if shared.ExceedsDailyLimit(ctx, db, projectID, "explore", dailyLimit) {
+		logf("探索：已达每日运行上限（%d）", dailyLimit)
+		*finalStatus = "skipped"
+		return
 	}
 
 	// Decrypt PAT
 	pat, err := a.decryptHex(pcfg.GitHub.PAT)
 	if err != nil {
-		logf("explore: decrypt PAT failed: %v", err)
+		logf("探索：PAT 解密失败：%v", err)
 		*finalStatus = "failed"
 		return
 	}
@@ -193,30 +180,30 @@ func (a *Agent) runLoop(
 	if pcfg.Test.StagingAuth != "" {
 		authJSON, err := a.decryptHex(pcfg.Test.StagingAuth)
 		if err == nil {
-			auth = parseAuthConfig(authJSON)
+			auth = shared.ParseAuthConfig(authJSON)
 		}
 	}
 
 	// Prepare screenshot dir
 	screenshotDir := fmt.Sprintf("/tmp/screenshots/%d/%d/%d", userID, projectID, runID)
 	if err := os.MkdirAll(screenshotDir, 0750); err != nil {
-		logf("explore: mkdir screenshot dir failed: %v", err)
+		logf("探索：截图目录创建失败：%v", err)
 	}
 	defer os.RemoveAll(screenshotDir)
 
 	// Pick up to 5 pending backlog scenarios
 	scenarios, err := a.pickScenarios(ctx, projectID, 5)
 	if err != nil {
-		logf("explore: pick scenarios failed: %v", err)
+		logf("探索：获取测试场景失败：%v", err)
 		*finalStatus = "failed"
 		return
 	}
 	if len(scenarios) == 0 {
-		logf("explore: no pending scenarios")
+		logf("探索：暂无待测场景")
 		return
 	}
 
-	logf("explore: running %d scenarios", len(scenarios))
+	logf("探索：开始运行 %d 个测试场景", len(scenarios))
 
 	ghClient := githubclient.New(string(pat))
 	bugsFound := 0
@@ -226,7 +213,7 @@ func (a *Agent) runLoop(
 			break
 		}
 
-		logf("explore: scenario %d: %s", sc.id, sc.title)
+		logf("场景 %d：%s", sc.id, sc.title)
 
 		exec := &playwright.Executor{
 			PlaywrightBin: playwrightBin,
@@ -248,19 +235,19 @@ func (a *Agent) runLoop(
 		}
 
 		if err != nil {
-			logf("explore: scenario %d executor error: %v", sc.id, err)
+			logf("场景 %d 执行出错：%v", sc.id, err)
 			_ = a.markScenario(ctx, sc.id, "tested") // don't fail on executor error
 			continue
 		}
 
 		if result.Passed {
-			logf("explore: scenario %d PASSED", sc.id)
+			logf("场景 %d：通过 ✓", sc.id)
 			_ = a.markScenario(ctx, sc.id, "tested")
 			continue
 		}
 
 		// Bug found — upload screenshots and open Issue
-		logf("explore: scenario %d FAILED: %s: %s", sc.id, result.ErrorType, result.ErrorMsg)
+		logf("场景 %d 失败：%s：%s", sc.id, result.ErrorType, result.ErrorMsg)
 		bugsFound++
 
 		screenshotURL := a.uploadScreenshots(ctx, result.Screenshots, userID, projectID, runID, sc.id, 0)
@@ -273,17 +260,17 @@ func (a *Agent) runLoop(
 			issueTitle, issueBody, nil,
 		)
 		if err != nil {
-			logf("explore: create issue failed: %v", err)
+			logf("探索：创建 Issue 失败：%v", err)
 			_ = a.markScenario(ctx, sc.id, "failed")
 			continue
 		}
 
 		_ = a.recordIssue(ctx, projectID, sc.id, issue.Number, issueTitle, priority)
 		_ = a.markScenario(ctx, sc.id, "failed")
-		logf("explore: opened issue #%d", issue.Number)
+		logf("探索：已创建 Issue #%d", issue.Number)
 	}
 
-	logf("explore: done — %d bugs found", bugsFound)
+	logf("探索完成，发现 %d 个问题", bugsFound)
 
 	// Auto-trigger plan if backlog is running low
 	go a.checkBacklogThreshold(projectID)
@@ -374,32 +361,6 @@ func (a *Agent) checkBacklogThreshold(projectID int64) {
 }
 
 // ---- helpers ----
-
-func parseAuthConfig(raw []byte) *playwright.AuthConfig {
-	var m map[string]string
-	if err := json.Unmarshal(raw, &m); err != nil {
-		return nil
-	}
-	return &playwright.AuthConfig{
-		Type:     m["type"],
-		Username: m["username"],
-		Password: m["password"],
-		Name:     m["name"],
-		Value:    m["value"],
-	}
-}
-
-func hostname(rawURL string) string {
-	// Fast extract: strip scheme, take up to first / or :
-	s := rawURL
-	if i := strings.Index(s, "://"); i >= 0 {
-		s = s[i+3:]
-	}
-	if i := strings.IndexAny(s, "/:"); i >= 0 {
-		s = s[:i]
-	}
-	return s
-}
 
 func seedCheckIndex(title string) int {
 	t := strings.ToLower(title)

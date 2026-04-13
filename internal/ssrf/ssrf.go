@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strings"
 )
 
 // ValidateURL checks that rawURL is an HTTPS URL pointing to a public IP.
@@ -43,6 +44,19 @@ func checkHostname(hostname string) error {
 		}
 	}
 	return nil
+}
+
+// ExtractHostname strips the scheme and port from a raw URL string,
+// returning just the hostname. Faster than url.Parse for hot paths.
+func ExtractHostname(rawURL string) string {
+	s := rawURL
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	if i := strings.IndexAny(s, "/:"); i >= 0 {
+		s = s[:i]
+	}
+	return s
 }
 
 func isPrivate(ip net.IP) bool {

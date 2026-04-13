@@ -22,6 +22,8 @@ func New(aiRunner, model, apiBase, apiKey string) (Runner, error) {
 		return &ClaudeCLIRunner{Model: model, APIKey: apiKey}, nil
 	case "aider":
 		return &AiderRunner{Model: model, APIBase: apiBase, APIKey: apiKey}, nil
+	case "gemini":
+		return &GeminiCLIRunner{Model: model, APIKey: apiKey}, nil
 	default:
 		return nil, fmt.Errorf("runner: unknown ai_runner %q", aiRunner)
 	}

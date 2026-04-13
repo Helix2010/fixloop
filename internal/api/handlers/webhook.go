@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -142,12 +143,14 @@ func validateWebhookToken(cfgJSON, token string) bool {
 	}
 	_ = json.Unmarshal([]byte(cfgJSON), &cfg)
 
+	tokenB := []byte(token)
 	for _, t := range cfg.WebhookTokens {
-		if t == token {
+		if subtle.ConstantTimeCompare([]byte(t), tokenB) == 1 {
 			return true
 		}
 	}
-	return cfg.WebhookToken != "" && cfg.WebhookToken == token
+	return cfg.WebhookToken != "" &&
+		subtle.ConstantTimeCompare([]byte(cfg.WebhookToken), tokenB) == 1
 }
 
 // migrateTokens reads webhook_tokens from raw config, migrating legacy webhook_token if present.
