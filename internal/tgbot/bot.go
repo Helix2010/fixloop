@@ -726,12 +726,13 @@ func (b *Bot) cmdSubmitIssue(ctx context.Context, chatID, senderChatID int64, ar
 	gh := githubclient.New(pat)
 
 	// Download screenshot bytes from Telegram (needed for both CDN upload and CLI analysis).
+	// Telegram files are capped at 20 MB; limit read to 25 MB as a safety margin.
 	var imgData []byte
 	if len(msg.Photo) > 0 {
 		largest := msg.Photo[len(msg.Photo)-1]
 		if tgFile, err := b.api.GetFile(tgbotapi.FileConfig{FileID: largest.FileID}); err == nil {
 			if resp, err := http.Get(tgFile.Link(b.api.Token)); err == nil { //nolint:noctx
-				imgData, _ = io.ReadAll(resp.Body)
+				imgData, _ = io.ReadAll(io.LimitReader(resp.Body, 25<<20))
 				resp.Body.Close()
 			}
 		}
@@ -753,9 +754,11 @@ func (b *Bot) cmdSubmitIssue(ctx context.Context, chatID, senderChatID int64, ar
 			ts := time.Now().UnixMilli()
 			// Only write to disk when the CLI runner will use it.
 			if useCliRunner {
-				tmpPath := fmt.Sprintf("/tmp/fixloop-issue-%d-%d.jpg", projectID, ts)
-				if os.WriteFile(tmpPath, imgData, 0600) == nil {
-					screenshotPath = tmpPath
+				if f, err := os.CreateTemp("", "fixloop-issue-*.jpg"); err == nil {
+					if _, werr := f.Write(imgData); werr == nil {
+						screenshotPath = f.Name()
+					}
+					f.Close()
 				}
 			}
 			// Try project-level S3 first, then fall back to server-level R2.

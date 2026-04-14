@@ -59,20 +59,40 @@ func ExtractHostname(rawURL string) string {
 	return s
 }
 
-func isPrivate(ip net.IP) bool {
-	private := []string{
-		"10.0.0.0/8",
-		"172.16.0.0/12",
-		"192.168.0.0/16",
-		"127.0.0.0/8",
-		"169.254.0.0/16",
-		"::1/128",
-		"fc00::/7",
-		"fe80::/10",
+// privateNets is parsed once at startup for efficient repeated SSRF checks.
+var privateNets []*net.IPNet
+
+func init() {
+	for _, cidr := range []string{
+		"0.0.0.0/8",          // "This" network
+		"10.0.0.0/8",         // RFC1918
+		"100.64.0.0/10",      // CGNAT (RFC6598)
+		"127.0.0.0/8",        // Loopback
+		"169.254.0.0/16",     // Link-local
+		"172.16.0.0/12",      // RFC1918
+		"192.168.0.0/16",     // RFC1918
+		"224.0.0.0/4",        // Multicast
+		"240.0.0.0/4",        // Reserved
+		"255.255.255.255/32", // Broadcast
+		"::1/128",            // IPv6 loopback
+		"fc00::/7",           // IPv6 unique local
+		"fe80::/10",          // IPv6 link-local
+		"ff00::/8",           // IPv6 multicast
+	} {
+		_, network, err := net.ParseCIDR(cidr)
+		if err == nil {
+			privateNets = append(privateNets, network)
+		}
 	}
-	for _, cidr := range private {
-		_, network, _ := net.ParseCIDR(cidr)
-		if network != nil && network.Contains(ip) {
+}
+
+func isPrivate(ip net.IP) bool {
+	// Unwrap IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1) before checking.
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	for _, network := range privateNets {
+		if network.Contains(ip) {
 			return true
 		}
 	}

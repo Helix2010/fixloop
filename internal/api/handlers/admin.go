@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"syscall"
 	"time"
@@ -19,6 +20,9 @@ import (
 	"github.com/fixloop/fixloop/internal/config"
 	"github.com/fixloop/fixloop/internal/crypto"
 )
+
+// tgBotUsernameRe enforces Telegram bot username rules: 5-32 chars, alphanumeric + underscore.
+var tgBotUsernameRe = regexp.MustCompile(`^[A-Za-z0-9_]{5,32}$`)
 
 // AdminHandler handles system-level admin settings.
 type AdminHandler struct {
@@ -91,6 +95,13 @@ func (h *AdminHandler) PatchTGConfig(c *gin.Context) {
 	}
 
 	if req.BotUsername != "" {
+		if !tgBotUsernameRe.MatchString(req.BotUsername) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{
+				"code":    "INVALID_USERNAME",
+				"message": "bot_username 只能包含字母、数字、下划线，长度 5-32 位",
+			}})
+			return
+		}
 		if _, err := h.DB.ExecContext(c.Request.Context(),
 			`INSERT INTO system_config (key_name, value) VALUES ('tg_bot_username', ?)
 			 ON DUPLICATE KEY UPDATE value = VALUES(value)`,

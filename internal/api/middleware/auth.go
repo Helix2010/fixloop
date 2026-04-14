@@ -62,6 +62,7 @@ func IssueJWT(c *gin.Context, jwtSecret []byte, userID int64, login string, maxA
 	if err != nil {
 		return err
 	}
+	c.SetSameSite(http.SameSiteStrictMode)
 	c.SetCookie("fixloop_session", signed, maxAge, "/", "", true, true)
 	return nil
 }

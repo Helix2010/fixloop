@@ -19,7 +19,6 @@ func NewRouter(db *sql.DB, cfg *config.Config, sched handlers.ProjectScheduler, 
 	r.Use(gin.Recovery())
 	r.Use(requestLogger())
 	r.Use(middleware.SecureHeaders())
-	r.Use(middleware.PerUserRateLimit(rate.Limit(20), 50))
 
 	healthH := &handlers.HealthHandler{DB: db}
 	r.GET("/health", healthH.Health)
@@ -42,6 +41,7 @@ func NewRouter(db *sql.DB, cfg *config.Config, sched handlers.ProjectScheduler, 
 
 	authed := v1.Group("/")
 	authed.Use(middleware.Auth(cfg.JWTSecret))
+	authed.Use(middleware.PerUserRateLimit(rate.Limit(20), 50))
 	{
 		authed.GET("/me", authH.UserInfo)
 		authed.DELETE("/me", authH.DeleteMe)

@@ -29,7 +29,14 @@ type AuthHandler struct {
 // GitHubLogin redirects to GitHub OAuth authorization page.
 // GET /api/v1/auth/github
 func (h *AuthHandler) GitHubLogin(c *gin.Context) {
-	state := generateState()
+	state, err := generateState()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{
+			"code": "RAND_ERROR", "message": "生成 state 失败",
+		}})
+		return
+	}
+	c.SetSameSite(http.SameSiteStrictMode)
 	c.SetCookie("oauth_state", state, 600, "/", "", true, true)
 
 	authURL := fmt.Sprintf(
@@ -52,6 +59,7 @@ func (h *AuthHandler) GitHubCallback(c *gin.Context) {
 		}})
 		return
 	}
+	c.SetSameSite(http.SameSiteStrictMode)
 	c.SetCookie("oauth_state", "", -1, "/", "", true, true)
 
 	code := c.Query("code")
@@ -131,6 +139,7 @@ func (h *AuthHandler) DeleteMe(c *gin.Context) {
 		}})
 		return
 	}
+	c.SetSameSite(http.SameSiteStrictMode)
 	c.SetCookie("fixloop_session", "", -1, "/", "", true, true)
 	c.JSON(http.StatusOK, gin.H{"data": gin.H{"message": "账号已删除"}})
 }
@@ -153,6 +162,11 @@ func (h *AuthHandler) TGBind(c *gin.Context) {
 	}
 	userID := c.MustGet("user_id").(int64)
 	ctx := c.Request.Context()
+
+	// Clean up expired bind tokens (older than 1 hour) to prevent unbounded table growth.
+	_, _ = h.DB.ExecContext(ctx,
+		`DELETE FROM system_config WHERE key_name LIKE 'tg_bind_%' AND updated_at < NOW() - INTERVAL 1 HOUR`,
+	)
 
 	// Rate-limit: max 5 active bind tokens per user per hour.
 	var activeTokens int
@@ -275,10 +289,12 @@ func (h *AuthHandler) upsertUser(ctx context.Context, u *githubUser) (int64, err
 	return id, err
 }
 
-func generateState() string {
+func generateState() (string, error) {
 	b := make([]byte, 24)
-	rand.Read(b)
-	return base64.URLEncoding.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.URLEncoding.EncodeToString(b), nil
 }
 
 // allowedRedirects is the whitelist of safe post-login destinations.

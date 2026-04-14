@@ -27,7 +27,7 @@ type StepAction struct {
 // Result holds the outcome of a test run.
 type Result struct {
 	Passed      bool
-	ErrorType   string   // "timeout"|"assertion"|"console_error"|"crash"
+	ErrorType   string // "timeout"|"assertion"|"console_error"|"crash"
 	ErrorMsg    string
 	Screenshots []string // local file paths
 }
@@ -43,11 +43,11 @@ type AuthConfig struct {
 
 // Executor runs Playwright tests.
 type Executor struct {
-	PlaywrightBin string        // path to playwright binary (e.g. /tmp/pw-test/node_modules/.bin/playwright)
+	PlaywrightBin string // path to playwright binary (e.g. /tmp/pw-test/node_modules/.bin/playwright)
 	StagingURL    string
-	StagingAuth   *AuthConfig // nil = no auth
-	ScreenshotDir string      // local dir for screenshots
-	ProfileDir    string      // --user-data-dir (unused currently)
+	StagingAuth   *AuthConfig   // nil = no auth
+	ScreenshotDir string        // local dir for screenshots
+	ProfileDir    string        // --user-data-dir (unused currently)
 	Timeout       time.Duration // per-scenario timeout, default 60s
 }
 
@@ -220,8 +220,13 @@ func renderStep(step StepAction, index int) (string, error) {
 		return "if (consoleErrors.length > 0) { throw new Error('console.error: ' + consoleErrors.join('; ')); }", nil
 
 	case "screenshot":
+		// Use only the base name to prevent path traversal via AI-generated step names.
+		safeName := filepath.Base(step.Name)
+		if safeName == "." || safeName == "/" {
+			safeName = "unnamed"
+		}
 		return fmt.Sprintf("await page.screenshot({ path: %s });",
-			jsLit(fmt.Sprintf("screenshot-%d-%s.png", index, step.Name))), nil
+			jsLit(fmt.Sprintf("screenshot-%d-%s.png", index, safeName))), nil
 
 	case "wait_ms":
 		return fmt.Sprintf("await page.waitForTimeout(%d);", step.WaitMs), nil

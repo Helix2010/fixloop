@@ -244,6 +244,18 @@ func (h *ProjectHandler) Create(c *gin.Context) {
 		response.BadRequest(c, err.Error())
 		return
 	}
+	if err := validateOptionalGitHubSlug("issue_tracker.owner", req.IssueTracker.Owner); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	if err := validateOptionalGitHubSlug("issue_tracker.repo", req.IssueTracker.Repo); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	if err := validateFixBaseBranch(req.GitHub.FixBaseBranch); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
 
 	// SSRF: validate staging URL before doing any crypto/DB work
 	if req.Test.StagingURL != "" {
@@ -475,14 +487,26 @@ func (h *ProjectHandler) Update(c *gin.Context) {
 			cfg.GitHub.PAT = enc
 		}
 		if req.GitHub.FixBaseBranch != "" {
+			if err := validateFixBaseBranch(req.GitHub.FixBaseBranch); err != nil {
+				response.BadRequest(c, err.Error())
+				return
+			}
 			cfg.GitHub.FixBaseBranch = req.GitHub.FixBaseBranch
 		}
 	}
 	if req.IssueTracker != nil {
 		if req.IssueTracker.Owner != "" {
+			if err := validateOptionalGitHubSlug("issue_tracker.owner", req.IssueTracker.Owner); err != nil {
+				response.BadRequest(c, err.Error())
+				return
+			}
 			cfg.IssueTracker.Owner = req.IssueTracker.Owner
 		}
 		if req.IssueTracker.Repo != "" {
+			if err := validateOptionalGitHubSlug("issue_tracker.repo", req.IssueTracker.Repo); err != nil {
+				response.BadRequest(c, err.Error())
+				return
+			}
 			cfg.IssueTracker.Repo = req.IssueTracker.Repo
 		}
 	}
@@ -801,6 +825,31 @@ func validateGitHubSlug(field, value string) error {
 	}
 	if !githubSlugRe.MatchString(value) {
 		return fmt.Errorf("%s contains invalid characters (only letters, digits, hyphens, underscores, dots allowed)", field)
+	}
+	return nil
+}
+
+// validateOptionalGitHubSlug is like validateGitHubSlug but treats empty as valid (optional field).
+func validateOptionalGitHubSlug(field, value string) error {
+	if value == "" {
+		return nil
+	}
+	return validateGitHubSlug(field, value)
+}
+
+// fixBaseBranchRe allows git branch names: alphanumeric, dots, slashes, hyphens, underscores.
+// Must start with alphanumeric. No ".." sequences. Max 100 chars.
+var fixBaseBranchRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/\-]{0,99}$`)
+
+func validateFixBaseBranch(branch string) error {
+	if branch == "" {
+		return nil // optional
+	}
+	if !fixBaseBranchRe.MatchString(branch) {
+		return fmt.Errorf("fix_base_branch 只允许字母、数字、点、斜杠、连字符，且必须以字母或数字开头（最长100字符）")
+	}
+	if strings.Contains(branch, "..") {
+		return fmt.Errorf("fix_base_branch 不能包含 '..'")
 	}
 	return nil
 }
